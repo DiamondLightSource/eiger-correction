@@ -8,21 +8,36 @@ Overlap statistics are descriptive, in-sample quantities, not uncertainties.
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
+from numpy.typing import ArrayLike, NDArray
 
 import eiger_correction.eiger_workflow as workflow
+from eiger_correction.eiger_workflow import (
+    BoolArray,
+    FloatArray,
+    IntArray,
+    Payload,
+    PhysicalModel,
+    Scan,
+)
 
 __all__ = ["save_diagnostics", "position_overlap_diagnostics"]
 
 
-def position_overlap_diagnostics(group, min_pixel_weight=100):
+def position_overlap_diagnostics(
+    group: Mapping[str, Any], min_pixel_weight: float = 100
+) -> dict[str, NDArray[Any]]:
     """Return notebook-equivalent leave-one-position-out B/E diagnostics.
 
     ``per_frame`` has shape (positions, 4, bins), ordered as signal,
@@ -75,7 +90,9 @@ def position_overlap_diagnostics(group, min_pixel_weight=100):
 
 
 @contextmanager
-def _figure(directory, summary, name, dpi, **kwargs):
+def _figure(
+    directory: Path, summary: Payload, name: str, dpi: float, **kwargs: Any
+) -> Iterator[Figure]:
     """Close even when drawing or JPEG encoding fails; register only saved files."""
     fig = plt.figure(constrained_layout=True, **kwargs)
     try:
@@ -87,12 +104,12 @@ def _figure(directory, summary, name, dpi, **kwargs):
         plt.close(fig)
 
 
-def _skip(summary, plot, reason):
+def _skip(summary: Payload, plot: str, reason: str) -> None:
     summary["skips"].append({"plot": plot, "reason": reason})
     summary["warnings"].append(f"{plot}: {reason}")
 
 
-def _limits(value, name):
+def _limits(value: ArrayLike, name: str) -> tuple[float, float]:
     limits = np.asarray(value, dtype=float)
     if (
         limits.shape != (2,)
@@ -100,10 +117,17 @@ def _limits(value, name):
         or limits[0] >= limits[1]
     ):
         raise ValueError(f"{name} must contain two increasing finite bounds")
-    return tuple(map(float, limits))
+    return float(limits[0]), float(limits[1])
 
 
-def _grouping_plot(directory, summary, raw_scan, scan, groups, dpi):
+def _grouping_plot(
+    directory: Path,
+    summary: Payload,
+    raw_scan: Scan,
+    scan: Scan,
+    groups: Sequence[IntArray],
+    dpi: float,
+) -> None:
     raw_angles = np.asarray(raw_scan.angles, dtype=float)
     exact, counts = np.unique(raw_angles, return_counts=True)
     minima = np.array([raw_angles[g].min() for g in groups])
@@ -168,12 +192,19 @@ def _grouping_plot(directory, summary, raw_scan, scan, groups, dpi):
         fig.suptitle("Recorded motor readings and actual analysis-group membership")
 
 
-def _azimuth_plot(directory, summary, scan, model, base_mask, dpi):
+def _azimuth_plot(
+    directory: Path,
+    summary: Payload,
+    scan: Scan,
+    model: PhysicalModel,
+    base_mask: ArrayLike,
+    dpi: float,
+) -> None:
     mask = np.asarray(base_mask, dtype=bool)
     denominator = np.count_nonzero(~mask)
     selected = (int(np.argmin(scan.angles)), int(np.argmax(scan.angles)))
-    previews = {}
-    retained = []
+    previews: dict[int, BoolArray] = {}
+    retained: list[int] = []
     for i, angle in enumerate(scan.angles):
         kept = ~(mask | workflow.azimuth_mask(model, float(angle)))
         retained.append(int(np.count_nonzero(kept)))
@@ -185,7 +216,7 @@ def _azimuth_plot(directory, summary, scan, model, base_mask, dpi):
     }
     with _figure(directory, summary, "azimuth_geometry", dpi, figsize=(15, 4)) as fig:
         axes = fig.subplots(1, 3)
-        for ax, i in zip(axes[:2], selected):
+        for ax, i in zip(axes[:2], selected, strict=True):
             ax.imshow(
                 previews[i], origin="lower", aspect="auto", cmap="gray", vmin=0, vmax=1
             )
@@ -211,11 +242,14 @@ def _azimuth_plot(directory, summary, scan, model, base_mask, dpi):
             title=f"Chi wedge: {getattr(model, 'azimuth_range', None)}°",
         )
         fig.suptitle(
-            "Per-position azimuth mask · geometry/pixel centres only, before count rejection"
+            "Per-position azimuth mask · geometry/pixel centres only, "
+            "before count rejection"
         )
 
 
-def _ring_current(scan, raw_scan, groups):
+def _ring_current(
+    scan: Scan, raw_scan: Scan, groups: Sequence[IntArray]
+) -> FloatArray | None:
     """Best-effort optional metadata; malformed/missing monitors are harmless."""
     try:
         ring = getattr(scan, "ring_current", None)
@@ -237,7 +271,15 @@ def _ring_current(scan, raw_scan, groups):
     return None
 
 
-def _fit_plot(directory, summary, raw_scan, scan, groups, fit, dpi):
+def _fit_plot(
+    directory: Path,
+    summary: Payload,
+    raw_scan: Scan,
+    scan: Scan,
+    groups: Sequence[IntArray],
+    fit: Mapping[str, Any],
+    dpi: float,
+) -> None:
     indices = np.asarray(fit.get("fit_indices", np.arange(len(scan.angles))), dtype=int)
     with _figure(directory, summary, "detector_response", dpi, figsize=(15, 10)) as fig:
         axes = fig.subplots(2, 2)
@@ -302,7 +344,14 @@ def _fit_plot(directory, summary, raw_scan, scan, groups, fit, dpi):
         ax.legend(fontsize=8)
 
 
-def _sampling_plot(directory, summary, sampling, model, n_positions, dpi):
+def _sampling_plot(
+    directory: Path,
+    summary: Payload,
+    sampling: Mapping[str, Any] | None,
+    model: PhysicalModel,
+    n_positions: int,
+    dpi: float,
+) -> None:
     if sampling is None:
         _skip(
             summary,
@@ -334,11 +383,12 @@ def _sampling_plot(directory, summary, sampling, model, n_positions, dpi):
         _skip(summary, "sampling_q", "Wavelength must be finite and positive")
         return
 
-    def to_q(theta):
+    def to_q(theta: ArrayLike) -> FloatArray:
         return 4 * np.pi * np.sin(np.deg2rad(theta) / 2) / wavelength
 
-    def to_theta(q):
-        return 2 * np.rad2deg(np.arcsin(np.clip(q * wavelength / (4 * np.pi), -1, 1)))
+    def to_theta(q: ArrayLike) -> FloatArray:
+        ratio = np.asarray(q, dtype=float) * wavelength / (4 * np.pi)
+        return 2 * np.rad2deg(np.arcsin(np.clip(ratio, -1, 1)))
 
     total = observations.sum(axis=0)
     equivalents = sizes.astype(np.int64) @ observations.astype(np.int64, copy=False)
@@ -383,12 +433,15 @@ def _sampling_plot(directory, summary, sampling, model, n_positions, dpi):
             )
             ax.grid(axis="y", alpha=0.2)
         fig.suptitle(
-            "Full-range sampling after final masks and count rejection · nonlinear Q edges"
+            "Full-range sampling after final masks and count rejection · "
+            "nonlinear Q edges"
         )
 
 
-def _residual_summary(diagnostics, window, angles):
-    rows = []
+def _residual_summary(
+    diagnostics: Mapping[str, NDArray[Any]], window: BoolArray, angles: FloatArray
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     for i, angle in enumerate(angles):
         values = diagnostics["residual"][i, window & diagnostics["valid"][i]]
         rows.append(
@@ -405,34 +458,38 @@ def _residual_summary(diagnostics, window, angles):
     return rows
 
 
-def _decorate(axes, diagnostic_range, boundaries):
+def _decorate(
+    axes: Sequence[Axes],
+    diagnostic_range: tuple[float, float],
+    boundaries: ArrayLike,
+) -> None:
     for ax in axes:
         ax.set_xlim(*diagnostic_range)
         ax.grid(alpha=0.2)
-        for boundary in boundaries:
+        for boundary in np.asarray(boundaries, dtype=float):
             if diagnostic_range[0] <= boundary <= diagnostic_range[1]:
                 ax.axvline(boundary, color="0.4", linestyle=":", linewidth=1)
 
 
 def _overlap_plots(
-    directory,
-    summary,
-    group,
-    final,
-    angles,
-    window,
-    diagnostic_range,
-    colors,
-    boundaries,
-    dpi,
-):
+    directory: Path,
+    summary: Payload,
+    group: Mapping[str, Any],
+    final: Mapping[str, NDArray[Any]],
+    angles: FloatArray,
+    window: BoolArray,
+    diagnostic_range: tuple[float, float],
+    colors: NDArray[Any],
+    boundaries: ArrayLike,
+    dpi: float,
+) -> None:
     x = np.asarray(group["axis"])
     intensity = np.asarray(group["intensity"])
     # Keep the existing filename so links in previously generated reports work.
     with _figure(directory, summary, "overlap_final_abcd", dpi, figsize=(15, 8)) as fig:
         axes = fig.subplots(2, 1, sharex=True)
         for i in range(len(angles)):
-            for ax, field in zip(axes[:2], ("curves", "residual")):
+            for ax, field in zip(axes[:2], ("curves", "residual"), strict=True):
                 ax.plot(
                     x[window],
                     final[field][i, window],
@@ -448,7 +505,10 @@ def _overlap_plots(
             label="Final merge",
         )
         axes[0].set(
-            title="A · Individual-position curves (including low pixel support) and final merge",
+            title=(
+                "A · Individual-position curves (including low pixel support) "
+                "and final merge"
+            ),
             ylabel="Intensity (a.u.)",
         )
         axes[0].legend()
@@ -460,18 +520,30 @@ def _overlap_plots(
         )
         _decorate(axes, diagnostic_range, boundaries)
         fig.suptitle(
-            "After final applied gains · measured I0 retained; dotted lines: detector-fit limits"
+            "After final applied gains · measured I0 retained; "
+            "dotted lines: detector-fit limits"
         )
         fig.supxlabel(
-            "Individual-position curves can spike where very few pixels contribute, especially near coverage edges.\n"
-            "A shows all supported bins; B applies the diagnostic pixel-weight threshold to both position and reference.\n"
-            "Pixel-splitting weights are geometric support, not photon counts. Spikes are not by themselves evidence of a correction defect.\n"
-            "Residuals are in-sample diagnostics, not independent validation or uncertainty estimates.",
+            "Individual-position curves can spike where very few pixels contribute, "
+            "especially near coverage edges.\n"
+            "A shows all supported bins; B applies the diagnostic pixel-weight "
+            "threshold to both position and reference.\n"
+            "Pixel-splitting weights are geometric support, not photon counts. "
+            "Spikes are not by themselves evidence of a correction defect.\n"
+            "Residuals are in-sample diagnostics, not independent validation "
+            "or uncertainty estimates.",
             fontsize=9,
         )
 
 
-def _gains_plot(directory, summary, scan, fit, processed_final, dpi):
+def _gains_plot(
+    directory: Path,
+    summary: Payload,
+    scan: Scan,
+    fit: Mapping[str, Any],
+    processed_final: Mapping[str, Any],
+    dpi: float,
+) -> None:
     angles = np.asarray(scan.angles)
     stage1 = np.asarray(fit["frame_gains"])
     final = np.asarray(processed_final["frame_gains"])
@@ -498,7 +570,14 @@ def _gains_plot(directory, summary, scan, fit, processed_final, dpi):
         ax.legend()
 
 
-def _xy_plot(directory, summary, group, theta_range, diagnostic_range, dpi):
+def _xy_plot(
+    directory: Path,
+    summary: Payload,
+    group: Mapping[str, Any],
+    theta_range: tuple[float, float],
+    diagnostic_range: tuple[float, float],
+    dpi: float,
+) -> None:
     x = np.asarray(group["axis"])
     intensity = np.asarray(group["intensity"])
     supported = (
@@ -540,27 +619,28 @@ def _xy_plot(directory, summary, group, theta_range, diagnostic_range, dpi):
             )
         fig.suptitle("Final integrated intensities · measured I0 retained")
         fig.supxlabel(
-            "One scalar per position; no smoothing, tapering, background subtraction or Q-dependent scale."
+            "One scalar per position; no smoothing, tapering, "
+            "background subtraction or Q-dependent scale."
         )
 
 
 def save_diagnostics(
-    output_directory: Path,
-    raw_scan,
-    scan,
-    frame_groups,
-    model,
-    base_mask,
-    fit,
-    processed_unity,
-    processed_final,
-    scale_fit,
+    output_directory: str | Path,
+    raw_scan: Scan,
+    scan: Scan,
+    frame_groups: Sequence[ArrayLike],
+    model: PhysicalModel,
+    base_mask: BoolArray,
+    fit: Mapping[str, Any],
+    processed_unity: Mapping[str, Any],
+    processed_final: Mapping[str, Any],
+    scale_fit: Mapping[str, Any] | None,
     *,
-    theta_range,
-    diagnostic_range=(30.0, 80.0),
-    min_pixel_weight=100,
-    dpi=140,
-) -> dict:
+    theta_range: ArrayLike,
+    diagnostic_range: ArrayLike = (30.0, 80.0),
+    min_pixel_weight: float = 100,
+    dpi: float = 140,
+) -> Payload:
     """Save JPEG diagnostics and return a strict-JSON-compatible summary.
 
     ``frame_groups`` lists raw-frame indices for each analysis position, in
@@ -581,8 +661,8 @@ def save_diagnostics(
     errors propagate; figures close even on failure. Output names are stable
     and existing JPEGs in the chosen directory are replaced.
     """
-    theta_range = _limits(theta_range, "theta_range")
-    diagnostic_range = _limits(diagnostic_range, "diagnostic_range")
+    theta_limits = _limits(theta_range, "theta_range")
+    diagnostic_limits = _limits(diagnostic_range, "diagnostic_range")
     if not np.isfinite(min_pixel_weight) or min_pixel_weight <= 0:
         raise ValueError("min_pixel_weight must be finite and positive")
     if not np.isfinite(dpi) or dpi <= 0:
@@ -598,16 +678,19 @@ def save_diagnostics(
         )
     directory = Path(output_directory)
     directory.mkdir(parents=True, exist_ok=True)
-    summary = {
+    summary: Payload = {
         "figures": [],
         "skips": [],
         "warnings": [],
         "residuals": {},
-        "theta_range_deg": list(theta_range),
-        "diagnostic_range_deg": list(diagnostic_range),
+        "theta_range_deg": list(theta_limits),
+        "diagnostic_range_deg": list(diagnostic_limits),
         "min_pixel_weight": float(min_pixel_weight),
-        "interpretation": "In-sample descriptive residuals; shared scales/calibration induce correlations. "
-        "Pixel support is not a photon-count threshold; no scale uncertainty is propagated.",
+        "interpretation": (
+            "In-sample descriptive residuals; shared scales/calibration induce "
+            "correlations. Pixel support is not a photon-count threshold; "
+            "no scale uncertainty is propagated."
+        ),
     }
     _grouping_plot(directory, summary, raw_scan, scan, groups, dpi)
     _azimuth_plot(directory, summary, scan, model, base_mask, dpi)
@@ -617,13 +700,13 @@ def save_diagnostics(
     )
     _gains_plot(directory, summary, scan, fit, processed_final, dpi)
     group = processed_final["groups"]["merged_2theta"]
-    _xy_plot(directory, summary, group, theta_range, diagnostic_range, dpi)
+    _xy_plot(directory, summary, group, theta_limits, diagnostic_limits, dpi)
 
     # Inspect the final exported integration without reapplying any gains.
     final = position_overlap_diagnostics(group, min_pixel_weight)
     x = np.asarray(group["axis"], dtype=float)
     angles = np.asarray(scan.angles, dtype=float)
-    window = (x >= diagnostic_range[0]) & (x <= diagnostic_range[1])
+    window = (x >= diagnostic_limits[0]) & (x <= diagnostic_limits[1])
     summary["residuals"] = {"final": _residual_summary(final, window, angles)}
     summary["scale_fit"] = {}
     for key in (
@@ -670,7 +753,7 @@ def save_diagnostics(
         final,
         angles,
         window,
-        diagnostic_range,
+        diagnostic_limits,
         colors,
         boundaries,
         dpi,

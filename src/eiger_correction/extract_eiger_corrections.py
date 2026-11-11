@@ -12,18 +12,30 @@ import tempfile
 import time
 import traceback
 import warnings
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from types import ModuleType
+from typing import TYPE_CHECKING, Any
 
 import h5py
 import numpy as np
+from numpy.typing import NDArray
 
 from eiger_correction.eiger_report import write_markdown_report
 
+if TYPE_CHECKING:
+    from eiger_correction.eiger_workflow import (
+        BoolArray,
+        Payload,
+        PhysicalModel,
+        Scan,
+    )
 
-def json_safe(value):
+
+def json_safe(value: Any) -> Any:
     """Strict JSON: nonfinite scientific metrics are null, never NaN/Infinity."""
     if isinstance(value, dict):
         return {str(key): json_safe(item) for key, item in value.items()}
@@ -43,27 +55,32 @@ def json_safe(value):
 class RunRecord:
     """Checkpoint the report at stage boundaries, including exceptions."""
 
-    def __init__(self, directory, arguments):
+    def __init__(self, directory: Path, arguments: argparse.Namespace) -> None:
         self.path = directory / "report.json"
         self.started = time.perf_counter()
-        self.data = {
+        self.data: dict[str, Any] = {
             "schema": "eiger_extraction_report_v1",
             "status": "running",
             "started_utc": datetime.now(UTC).isoformat(),
             "arguments": vars(arguments),
             "stages": {},
             "warnings": [],
-            "validation_scope": "Held-out checks test stage 1 only. Stage-2 overlap residuals are in-sample.",
+            "validation_scope": (
+                "Held-out checks test stage 1 only. "
+                "Stage-2 overlap residuals are in-sample."
+            ),
             "limitations": [
                 "Detector response outside the fit Q range is extrapolated.",
-                "Poisson sigma excludes scale, calibration, I0 and model uncertainty and bin covariance.",
-                "Source-position gains are source-scan-only, not transferable corrections.",
+                "Poisson sigma excludes scale, calibration, I0 and model uncertainty "
+                "and bin covariance.",
+                "Source-position gains are source-scan-only, "
+                "not transferable corrections.",
                 "Successful integrity checks do not certify scientific accuracy.",
             ],
         }
         self.save()
 
-    def save(self):
+    def save(self) -> None:
         self.data["elapsed_seconds"] = time.perf_counter() - self.started
         snapshot = json_safe(self.data)
         temporary = self.path.with_suffix(".json.tmp")
@@ -74,8 +91,9 @@ class RunRecord:
         write_markdown_report(self.path.with_suffix(".md"), snapshot)
 
     @contextmanager
-    def stage(self, name):
-        entry = self.data["stages"][name] = {"status": "running"}
+    def stage(self, name: str) -> Iterator[None]:
+        entry: dict[str, Any] = {"status": "running"}
+        self.data["stages"][name] = entry
         self.data["current_stage"] = name
         self.save()
         started = time.perf_counter()
@@ -91,13 +109,16 @@ class RunRecord:
             self.save()
 
 
-def parser():
+def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("scan", type=Path, help="Source NeXus scan (read-only)")
     result.add_argument(
         "--geometry",
         type=Path,
-        help="Override goniometer calibration JSON; default: /entry/plan_metadata/geometry_calibration in the scan",
+        help=(
+            "Override goniometer calibration JSON; default: "
+            "/entry/plan_metadata/geometry_calibration in the scan"
+        ),
     )
     result.add_argument(
         "--output-dir",
@@ -135,7 +156,9 @@ def parser():
         "--theta-max",
         type=float,
         default=80.0,
-        help="Upper 2theta in degrees; 0 selects automatic unmasked pixel-centre maximum",
+        help=(
+            "Upper 2theta in degrees; 0 selects automatic unmasked pixel-centre maximum"
+        ),
     )
     result.add_argument("--angle-tolerance", type=float, default=0.001)
     result.add_argument(
@@ -155,7 +178,10 @@ def parser():
         "--validation",
         choices=("basic", "holdout", "full"),
         default="holdout",
-        help="Always integrity checks; holdout adds one independent detector fold, full adds both folds and lower-Q gain checks",
+        help=(
+            "Always integrity checks; holdout adds one independent detector fold, "
+            "full adds both folds and lower-Q gain checks"
+        ),
     )
     result.add_argument(
         "--raw-audit",
@@ -173,7 +199,9 @@ def parser():
     return result
 
 
-def load_geometry(scan_path, geometry_path=None):
+def load_geometry(
+    scan_path: str | Path, geometry_path: str | Path | None = None
+) -> tuple[dict[str, Any], dict[str, str]]:
     """Return the selected geometry dictionary and its source/checksum.
 
     An explicit file always wins: file errors never silently fall back to NeXus.
@@ -187,7 +215,10 @@ def load_geometry(scan_path, geometry_path=None):
     else:
         path = Path(scan_path).resolve()
         dataset_path = "/entry/plan_metadata/geometry_calibration"
-        message = f"No usable embedded geometry JSON at {path}::{dataset_path}; supply --geometry JSON_FILE"
+        message = (
+            f"No usable embedded geometry JSON at {path}::{dataset_path}; "
+            "supply --geometry JSON_FILE"
+        )
         with h5py.File(path, "r") as source:
             node = source.get(dataset_path)
             if not isinstance(node, h5py.Dataset):
@@ -211,7 +242,8 @@ def load_geometry(scan_path, geometry_path=None):
         config = json.loads(payload)
     except (ValueError, UnicodeError) as error:
         raise ValueError(
-            f"Invalid geometry JSON from {provenance['geometry']}; supply a valid --geometry JSON_FILE"
+            f"Invalid geometry JSON from {provenance['geometry']}; "
+            "supply a valid --geometry JSON_FILE"
         ) from error
     if not isinstance(config, dict):
         raise ValueError(
@@ -221,7 +253,7 @@ def load_geometry(scan_path, geometry_path=None):
     return config, provenance
 
 
-def check_arguments(args):
+def check_arguments(args: argparse.Namespace) -> None:
     for name in ("fit_q_range", "diagnostic_range"):
         low, high = getattr(args, name)
         if not np.all(np.isfinite([low, high])) or not low < high:
@@ -242,17 +274,26 @@ def check_arguments(args):
         raise ValueError("polarization must be finite and in [-1, 1]")
 
 
-def integrate_theta(scan, model, fit, base_mask, theta_range, npt, group_sizes):
+def integrate_theta(
+    scan: Scan,
+    model: PhysicalModel,
+    fit: Mapping[str, Any],
+    base_mask: BoolArray,
+    theta_range: tuple[float, float],
+    npt: int,
+    group_sizes: Sequence[int],
+) -> Payload:
     """One grouped-data pass: integrate only 2theta and collect sampling counts."""
-    import eiger_workflow as workflow
+    import eiger_correction.eiger_workflow as workflow
 
     mask = base_mask | fit["bad_pixel_mask"] | scan.native_mask
     results = {}
     observations = np.zeros((len(scan.angles), npt), dtype=np.int64)
-    edges = np.linspace(*theta_range, npt + 1)
+    edges = np.linspace(theta_range[0], theta_range[1], npt + 1)
     with h5py.File(scan.detector_path, "r") as source:
+        frames = workflow.h5_dataset(source, scan.detector_dataset)
         for index, angle in enumerate(scan.angles):
-            counts = np.asarray(source[scan.detector_dataset][index], dtype=float)
+            counts = np.asarray(frames[index], dtype=float)
             results[index] = workflow.integrate_frame(
                 model,
                 counts,
@@ -311,7 +352,11 @@ def integrate_theta(scan, model, fit, base_mask, theta_range, npt, group_sizes):
     }
 
 
-def check_conservation(unity, final, scale_fit):
+def check_conservation(
+    unity: Mapping[str, Any],
+    final: Mapping[str, Any],
+    scale_fit: Mapping[str, Any],
+) -> dict[str, Any]:
     group = final["groups"]["merged_2theta"]
     original = unity["groups"]["merged_2theta"]["per_frame"]
     scaled = group["per_frame"]
@@ -351,14 +396,24 @@ def check_conservation(unity, final, scale_fit):
 
 
 def raw_audit(
-    workflow, raw, scan, groups, model, fit, final, theta_range, npt, saturation
-):
+    workflow: ModuleType,
+    raw: Scan,
+    scan: Scan,
+    groups: Sequence[NDArray[np.integer[Any]]],
+    model: PhysicalModel,
+    fit: Mapping[str, Any],
+    final: Mapping[str, Any],
+    theta_range: tuple[float, float],
+    npt: int,
+    saturation: float,
+) -> dict[str, Any]:
     index = int(np.argmax(scan.angles))
     counts = np.zeros(scan.shape)
     invalid = np.zeros(scan.shape, dtype=bool)
     with h5py.File(raw.detector_path, "r") as source:
+        frames = workflow.h5_dataset(source, raw.detector_dataset)
         for member in groups[index]:
-            frame = np.asarray(source[raw.detector_dataset][int(member)], dtype=float)
+            frame = np.asarray(frames[int(member)], dtype=float)
             bad = ~np.isfinite(frame) | (frame < 0) | (frame >= saturation)
             invalid |= bad
             counts += np.where(bad, 0, frame)
@@ -388,12 +443,13 @@ def raw_audit(
     return {"status": "passed", "position": index, "raw_frames": len(groups[index])}
 
 
-def extract(args, directory, record):
+def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> None:
     # Register compressed detector filters and import scientific libraries inside
     # the captured run, so library messages/warnings go to run.log as well.
-    import eiger_workflow as workflow
     import hdf5plugin  # noqa: F401
-    from eiger_diagnostics import save_diagnostics
+
+    import eiger_correction.eiger_workflow as workflow
+    from eiger_correction.eiger_diagnostics import save_diagnostics
 
     with record.stage("inputs"):
         check_arguments(args)
@@ -406,16 +462,17 @@ def extract(args, directory, record):
             if current_path in source:
                 try:
                     raw.ring_current = np.asarray(
-                        source[current_path][()], dtype=float
+                        workflow.h5_dataset(source, current_path)[()], dtype=float
                     ).reshape(-1)
                 except (ValueError, TypeError, OSError):
                     record.data["warnings"].append(
-                        "Optional ring-current metadata could not be decoded; overlay omitted."
+                        "Optional ring-current metadata could not be decoded; "
+                        "overlay omitted."
                     )
         azimuth = workflow.validate_azimuth_range(
             None if args.all_azimuths else args.azimuth_range
         )
-        packages = {}
+        packages: dict[str, str] = {}
         for name in (
             "numpy",
             "scipy",
@@ -482,7 +539,9 @@ def extract(args, directory, record):
                 ],
                 "angles_deg": scan.angles,
                 "summed_i0": scan.i0,
-                "checks": "Complete frame partition; arithmetic mean motor angles; summed I0",
+                "checks": (
+                    "Complete frame partition; arithmetic mean motor angles; summed I0"
+                ),
             }
         with record.stage("geometry"):
             model = workflow.PhysicalModel(
@@ -500,7 +559,7 @@ def extract(args, directory, record):
                 "constant_pattern": "passed",
                 "fixed_mask_pixels": int(base_mask.sum()),
             }
-        options = {
+        options: dict[str, Any] = {
             "npt": args.fit_bins,
             "iterations": args.iterations,
             "fit_frame_gains": True,
@@ -540,7 +599,7 @@ def extract(args, directory, record):
                     array.nbytes for item in cache.values() for array in item.values()
                 ),
             }
-        reports = []
+        reports: list[dict[str, Any]] = []
         with record.stage("held_out_validation"):
             if args.validation == "basic":
                 record.data["warnings"].append(
@@ -550,7 +609,7 @@ def extract(args, directory, record):
                 folds = [(indices[::2], indices[1::2])]
                 if args.validation == "full":
                     folds.append((indices[1::2], indices[::2]))
-                sensor_gains = []
+                sensor_gains: list[NDArray[np.floating[Any]]] = []
                 for fold, (train, test) in enumerate(folds, start=1):
                     held_fit = workflow.fit_response(
                         cache,
@@ -599,7 +658,8 @@ def extract(args, directory, record):
                             or after > before
                         ):
                             record.data["warnings"].append(
-                                f"Fold {fold}: detector-only {metric} did not improve or is nonfinite; inspect held-out metrics."
+                                f"Fold {fold}: detector-only {metric} did not "
+                                "improve or is nonfinite; inspect held-out metrics."
                             )
                     record.data["held_out_validation"] = reports
                     record.save()
@@ -694,7 +754,7 @@ def extract(args, directory, record):
             )
             # Augment only our newly-created local output; never source files.
             with h5py.File(calibration_path, "r+") as target:
-                diagnostic = target["fit_diagnostics"]
+                diagnostic = workflow.h5_group(target, "fit_diagnostics")
                 nuisance = diagnostic.create_dataset(
                     "detector_fit_nuisance_frame_gains", data=fit["frame_gains"]
                 )
@@ -728,7 +788,9 @@ def extract(args, directory, record):
                     stream,
                     xy,
                     fmt="%.10g",
-                    header="2theta_deg intensity; two_stage_overlap; measured I0 retained",
+                    header=(
+                        "2theta_deg intensity; two_stage_overlap; measured I0 retained"
+                    ),
                 )
             np.testing.assert_allclose(
                 np.loadtxt(directory / "pattern_2theta.xy", ndmin=2),
@@ -743,7 +805,7 @@ def extract(args, directory, record):
                 "log": "run.log",
             }
         with record.stage("jpeg_diagnostics"):
-            diagnostic = save_diagnostics(
+            summary = save_diagnostics(
                 directory,
                 raw,
                 scan,
@@ -759,11 +821,11 @@ def extract(args, directory, record):
                 min_pixel_weight=args.overlap_min_pixels,
                 dpi=args.jpeg_dpi,
             )
-            record.data["diagnostics"] = diagnostic
-            record.data["warnings"].extend(diagnostic.get("warnings", []))
+            record.data["diagnostics"] = summary
+            record.data["warnings"].extend(summary.get("warnings", []))
 
 
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     directory = (
         args.output_dir

@@ -4,28 +4,52 @@ from __future__ import annotations
 
 import json
 import tempfile
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any, cast
 
 import h5py
 import numpy as np
 import pyFAI
 import xraylib
+from numpy.typing import ArrayLike, NDArray
+from pyFAI.containers import Integrate1dResult
 from pyFAI.goniometer import Goniometer
+from pyFAI.integrator.azimuthal import AzimuthalIntegrator
 
 SCHEMA = "eiger_joint_calibration_v1"
 METHOD = ("bbox", "csr", "cython")
-UNCERTAINTY = "Raw-count Poisson propagation only; excludes calibration, I0, model uncertainty and bin covariance"
+UNCERTAINTY = (
+    "Raw-count Poisson propagation only; excludes calibration, I0, "
+    "model uncertainty and bin covariance"
+)
+
+FloatArray = NDArray[np.floating[Any]]
+BoolArray = NDArray[np.bool_]
+IntArray = NDArray[np.integer[Any]]
+Payload = dict[str, Any]
+Cache = dict[int, dict[str, NDArray[Any]]]
 
 
-def _array(file, path):
+def h5_dataset(node: h5py.Group, path: str) -> h5py.Dataset:
+    """Look up a dataset without a runtime type check, so test mocks still work."""
+    return cast(h5py.Dataset, node[path])
+
+
+def h5_group(node: h5py.Group, path: str) -> h5py.Group:
+    """Look up a group without a runtime type check."""
+    return cast(h5py.Group, node[path])
+
+
+def _array(file: h5py.Group, path: str) -> NDArray[Any]:
     dataset = file[path]
     if not isinstance(dataset, h5py.Dataset):
         raise ValueError(f"{path} is not a dataset")
     return np.asarray(dataset[()])
 
 
-def _text(value):
+def _text(value: object) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
@@ -34,18 +58,25 @@ class Scan:
     path: Path
     detector_path: Path
     detector_dataset: str
-    angles: np.ndarray
-    i0: np.ndarray
-    native_mask: np.ndarray
+    angles: FloatArray
+    i0: FloatArray
+    native_mask: BoolArray
     energy_kev: float
     thickness_m: float
     material: str
     orientation: int
     wavelength_m: float
     shape: tuple[int, int]
+    # Optional raw-frame synchrotron ring current, used only for diagnostics.
+    ring_current: FloatArray | None = None
 
 
-def load_scan(path, detector_path=None, monitor_path=None, metadata_path=None):
+def load_scan(
+    path: str | Path,
+    detector_path: str | Path | None = None,
+    monitor_path: str | Path | None = None,
+    metadata_path: str | Path | None = None,
+) -> Scan:
     path = Path(path).resolve()
     detector_path = (
         Path(detector_path)
@@ -69,8 +100,9 @@ def load_scan(path, detector_path=None, monitor_path=None, metadata_path=None):
             orientation = int(calibration_config["detector_config"]["orientation"])
             wavelength = float(calibration_config["wavelength"])
         else:
-            orientation = int(_array(calibration, "detector_config/orientation"))
-            wavelength = float(_array(calibration, "wavelength"))
+            group = cast(h5py.Group, calibration)
+            orientation = int(_array(group, "detector_config/orientation"))
+            wavelength = float(_array(group, "wavelength"))
         nexus_mask = (
             _array(file, "entry/instrument/fastcs_eiger/pixel_mask")
             if "entry/instrument/fastcs_eiger/pixel_mask" in file
@@ -86,14 +118,15 @@ def load_scan(path, detector_path=None, monitor_path=None, metadata_path=None):
         thickness = float(_array(file, "_dectris/sensor_thickness").reshape(-1)[0])
         material = _text(_array(file, "_dectris/sensor_material").reshape(-1)[0])
     with h5py.File(detector_path, "r") as file:
-        shape = file[detector_dataset].shape
+        shape = h5_dataset(file, detector_dataset).shape
     if (
         shape != (len(angles), 512, 1028)
         or len(i0) != len(angles)
         or mask.shape != shape[1:]
     ):
         raise ValueError(
-            "Expected matching frame, angle, I0 and mask arrays for EIGER2 CdTe 500K (512,1028)"
+            "Expected matching frame, angle, I0 and mask arrays "
+            "for EIGER2 CdTe 500K (512,1028)"
         )
     if not np.all(np.isfinite(angles)) or not np.all(np.isfinite(i0) & (i0 > 0)):
         raise ValueError(
@@ -117,13 +150,16 @@ def load_scan(path, detector_path=None, monitor_path=None, metadata_path=None):
         material,
         orientation,
         wavelength,
-        shape[1:],
+        (shape[1], shape[2]),
     )
 
 
 def aggregate_equal_angle_frames(
-    scan, output_path, saturation=1e7, angle_tolerance=0.0
-):
+    scan: Scan,
+    output_path: str | Path,
+    saturation: float = 1e7,
+    angle_tolerance: float = 0.0,
+) -> tuple[Scan, list[NDArray[np.intp]]]:
     """Sum equal or tolerance-matched angle frames and I0 into a compact file.
 
     A detector pixel is retained in an aggregate only when every constituent
@@ -142,7 +178,7 @@ def aggregate_equal_angle_frames(
         raise ValueError("angle_tolerance must be finite and nonnegative")
 
     unique_angles, inverse = np.unique(scan.angles, return_inverse=True)
-    angle_clusters = []
+    angle_clusters: list[list[int]] = []
     for angle_index, angle in enumerate(unique_angles):
         if (
             not angle_clusters
@@ -172,7 +208,7 @@ def aggregate_equal_angle_frames(
         h5py.File(scan.detector_path, "r") as source,
         h5py.File(output_path, "x") as target,
     ):
-        source_data = source[scan.detector_dataset]
+        source_data = h5_dataset(source, scan.detector_dataset)
         aggregated = target.create_dataset(
             "data",
             shape=(len(angle_clusters), *scan.shape),
@@ -200,7 +236,8 @@ def aggregate_equal_angle_frames(
             "source_frame_indices", data=np.concatenate(group_members)
         )
         target.attrs["aggregation"] = (
-            "angle-group raw-count sum; I0 summed; any invalid constituent masks that pixel"
+            "angle-group raw-count sum; I0 summed; "
+            "any invalid constituent masks that pixel"
         )
         target.attrs["angle_tolerance_deg"] = angle_tolerance
         target.attrs["source_scan"] = str(scan.path)
@@ -211,10 +248,14 @@ def aggregate_equal_angle_frames(
         detector_dataset="data",
         angles=grouped_angles,
         i0=grouped_i0,
+        # Raw-frame metadata does not describe the grouped positions.
+        ring_current=None,
     ), group_members
 
 
-def detector_layout(shape):
+def detector_layout(
+    shape: tuple[int, ...],
+) -> tuple[BoolArray, NDArray[np.int16]]:
     if shape != (512, 1028):
         raise ValueError("Only the documented EIGER2 CdTe 500K layout is supported")
     boundaries = np.zeros(shape, dtype=bool)
@@ -232,14 +273,16 @@ def detector_layout(shape):
     return boundaries, sensors
 
 
-def _geometry_from_config(config):
+def _geometry_from_config(config: Mapping[str, Any]) -> Goniometer:
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as file:
         json.dump(config, file)
         file.flush()
         return Goniometer.sload(file.name)
 
 
-def validate_azimuth_range(azimuth_range):
+def validate_azimuth_range(
+    azimuth_range: ArrayLike | None,
+) -> tuple[float, float] | None:
     """Normalize a directed, inclusive chi wedge in degrees; None keeps all chi.
 
     Bounds may cross the +/-180-degree seam, e.g. (170, -170). Equal
@@ -262,7 +305,11 @@ def validate_azimuth_range(azimuth_range):
     return lower, upper
 
 
-def azimuth_mask(model, angle, integrator=None):
+def azimuth_mask(
+    model: PhysicalModel,
+    angle: float,
+    integrator: AzimuthalIntegrator | None = None,
+) -> BoolArray:
     """True outside the model's chi wedge, evaluated at this motor position.
 
     This is a pixel-centre mask, not fractional clipping at wedge boundaries.
@@ -287,8 +334,13 @@ def azimuth_mask(model, angle, integrator=None):
 
 class PhysicalModel:
     def __init__(
-        self, geometry_config, scan, polarization=0.95, density=6.2, azimuth_range=None
-    ):
+        self,
+        geometry_config: Mapping[str, Any],
+        scan: Scan,
+        polarization: float = 0.95,
+        density: float = 6.2,
+        azimuth_range: ArrayLike | None = None,
+    ) -> None:
         self.azimuth_range = validate_azimuth_range(azimuth_range)
         self.config = geometry_config
         self.geometry = _geometry_from_config(geometry_config)
@@ -312,25 +364,28 @@ class PhysicalModel:
         if not 0 < self.transmission < 1:
             raise ValueError("Degenerate attenuation model")
 
-    def arrays(self, angle):
+    def arrays(
+        self, angle: float
+    ) -> tuple[AzimuthalIntegrator, FloatArray, FloatArray, FloatArray, float]:
         integrator = self.geometry.get_ai(float(angle))
         theta = integrator.center_array(self.shape, unit="2th_rad")
-        q_pixels = 4 * np.pi * np.sin(theta / 2) / (integrator.wavelength * 1e9)
-        prefactor = integrator.pixel1 * integrator.pixel2 / integrator.dist**2
-        absorption = (
-            integrator.calc_transmission(self.transmission, shape=self.shape)
-            * self.efficiency
+        wavelength = cast(float, integrator.wavelength)
+        q_pixels = 4 * np.pi * np.sin(theta / 2) / (wavelength * 1e9)
+        prefactor = float(integrator.pixel1 * integrator.pixel2 / integrator.dist**2)
+        transmission = cast(
+            FloatArray,
+            integrator.calc_transmission(self.transmission, shape=self.shape),
         )
-        norm = (
-            integrator.solidAngleArray(self.shape)
-            * prefactor
-            * integrator.polarization(self.shape, factor=self.polarization)
-            * absorption
+        absorption = transmission * self.efficiency
+        solid_angle = cast(FloatArray, integrator.solidAngleArray(self.shape))
+        polarization = cast(
+            FloatArray, integrator.polarization(self.shape, factor=self.polarization)
         )
+        norm = solid_angle * prefactor * polarization * absorption
         return integrator, q_pixels, norm, absorption, prefactor
 
-    def vertical_check(self):
-        rows = []
+    def vertical_check(self) -> list[dict[str, float]]:
+        rows: list[dict[str, float]] = []
         for angle in (20, 40, 60):
             integrator = self.geometry.get_ai(angle)
             ray_z, ray_y, ray_x = integrator.calc_pos_zyx(
@@ -347,24 +402,25 @@ class PhysicalModel:
             )
             if fraction < 0.99:
                 raise ValueError(
-                    "Geometry is not predominantly vertical: verify polarization convention before proceeding"
+                    "Geometry is not predominantly vertical: "
+                    "verify polarization convention before proceeding"
                 )
         return rows
 
 
 def integrate_frame(
-    model,
-    counts,
-    angle,
-    monitor,
-    mask,
-    divisor,
-    npt,
-    radial_range,
-    unit="q_nm^-1",
-    frame_gain=1.0,
-    saturation=1e7,
-):
+    model: PhysicalModel,
+    counts: ArrayLike,
+    angle: float,
+    monitor: float,
+    mask: BoolArray,
+    divisor: FloatArray | float,
+    npt: int,
+    radial_range: tuple[float, float],
+    unit: str = "q_nm^-1",
+    frame_gain: float = 1.0,
+    saturation: float = 1e7,
+) -> Integrate1dResult:
     integrator, q_pixels, norm, absorption, prefactor = model.arrays(angle)
     counts = np.asarray(counts, dtype=float)
     bad = (
@@ -393,23 +449,36 @@ def integrate_frame(
     )
 
 
-def constant_pattern_check(model, base_mask, q_range, npt):
+def constant_pattern_check(
+    model: PhysicalModel,
+    base_mask: BoolArray,
+    q_range: tuple[float, float],
+    npt: int,
+) -> None:
     integrator, q_pixels, norm, absorption, prefactor = model.arrays(40)
     result = integrate_frame(
         model, 1e10 * norm, 40, 1, base_mask, np.ones(model.shape), npt, q_range
     )
-    np.testing.assert_allclose(result.intensity[result.count > 0], 1e10, rtol=3e-6)
+    count = np.asarray(result.count)
+    np.testing.assert_allclose(result.intensity[count > 0], 1e10, rtol=3e-6)
 
 
-def build_cache(scan, model, base_mask, q_range=(200, 400), npt=800, saturation=1e7):
+def build_cache(
+    scan: Scan,
+    model: PhysicalModel,
+    base_mask: BoolArray,
+    q_range: tuple[float, float] = (200, 400),
+    npt: int = 800,
+    saturation: float = 1e7,
+) -> Cache:
     if not 0 < q_range[0] < q_range[1] or not 16 <= npt <= 65535:
         raise ValueError("Invalid fitting q range or bin count")
-    cache = {}
+    cache: Cache = {}
     step = (q_range[1] - q_range[0]) / npt
     with h5py.File(scan.detector_path, "r") as file:
         for index, angle in enumerate(scan.angles):
             integrator, q_pixels, norm, absorption, prefactor = model.arrays(angle)
-            counts = file[scan.detector_dataset][index]
+            counts = h5_dataset(file, scan.detector_dataset)[index]
             valid = (
                 ~(base_mask | azimuth_mask(model, angle, integrator))
                 & np.isfinite(counts)
@@ -431,25 +500,26 @@ def build_cache(scan, model, base_mask, q_range=(200, 400), npt=800, saturation=
                 }
     if len(cache) < 4:
         raise ValueError(
-            "Too few contributing scan positions; choose a supported fitting range or denser scan"
+            "Too few contributing scan positions; "
+            "choose a supported fitting range or denser scan"
         )
     return cache
 
 
 def fit_response(
-    cache,
-    indices,
-    sensor_ids,
-    frame_count,
-    npt=800,
-    iterations=10,
-    fit_frame_gains=True,
-    fractional_floor=0.003,
-    reject_z=5.0,
-    minimum_observations=8,
-    shrink_weight=300.0,
-    frame_prior_sigma=0.01,
-):
+    cache: Cache,
+    indices: ArrayLike,
+    sensor_ids: IntArray,
+    frame_count: int,
+    npt: int = 800,
+    iterations: int = 10,
+    fit_frame_gains: bool = True,
+    fractional_floor: float = 0.003,
+    reject_z: float = 5.0,
+    minimum_observations: int = 8,
+    shrink_weight: float = 300.0,
+    frame_prior_sigma: float = 0.01,
+) -> Payload:
     indices = np.asarray(indices, dtype=int)
     if len(indices) < 2 or any(int(index) not in cache for index in indices):
         raise ValueError("Invalid fit positions")
@@ -476,14 +546,14 @@ def fit_response(
     profile_log = np.interp(
         np.arange(npt), np.flatnonzero(supported), profile_log[supported]
     )
-    history = []
+    history: list[dict[str, float]] = []
     for iteration in range(iterations):
         previous_pixel, previous_sensor, previous_frame = (
             pixel_log.copy(),
             sensor_log.copy(),
             frame_log.copy(),
         )
-        weights_by_frame = {}
+        weights_by_frame: dict[int, FloatArray] = {}
         profile_sum[:] = profile_weight[:] = 0
         for index in indices:
             index = int(index)
@@ -540,7 +610,9 @@ def fit_response(
             selected = usable & (sensors_flat == sensor_index)
             if not selected.any():
                 raise ValueError(
-                    f"Sensor {sensor_index + 1} has too few repeated pixel observations; lower minimum_observations only with justification or use a denser scan"
+                    f"Sensor {sensor_index + 1} has too few repeated pixel "
+                    "observations; lower minimum_observations only with "
+                    "justification or use a denser scan"
                 )
             offset = np.average(pixel_log[selected], weights=pixel_weight[selected])
             pixel_log[selected] -= offset
@@ -656,7 +728,7 @@ def fit_response(
     }
 
 
-def merge_results(results):
+def merge_results(results: Mapping[int, Integrate1dResult]) -> Payload:
     if not results:
         raise ValueError("No integrations to merge")
     axis = next(iter(results.values())).radial.copy()
@@ -685,14 +757,15 @@ def merge_results(results):
     }
 
 
-def overlap_summary(results):
-    centered, absolute = [], []
+def overlap_summary(results: Mapping[int, Integrate1dResult]) -> dict[str, float]:
+    centered: list[float] = []
+    absolute: list[float] = []
     indices = sorted(results)
-    for left_index, right_index in zip(indices[:-1], indices[1:]):
+    for left_index, right_index in zip(indices[:-1], indices[1:], strict=True):
         left, right = results[left_index], results[right_index]
         valid = (
-            (left.count >= 100)
-            & (right.count >= 100)
+            (np.asarray(left.count) >= 100)
+            & (np.asarray(right.count) >= 100)
             & (left.intensity > 0)
             & (right.intensity > 0)
         )
@@ -708,7 +781,7 @@ def overlap_summary(results):
     }
 
 
-def _position_accumulators(group):
+def _position_accumulators(group: Mapping[str, Any]) -> FloatArray:
     """Validate the common axis and four-field position accumulator layout."""
     try:
         frames = np.asarray(group["per_frame"], dtype=float)
@@ -722,7 +795,8 @@ def _position_accumulators(group):
         or frames.shape[2] == 0
     ):
         raise ValueError(
-            "per_frame must have shape (positions, 4, bins), with nonempty positions/bins"
+            "per_frame must have shape (positions, 4, bins), "
+            "with nonempty positions/bins"
         )
     if axis.shape != (frames.shape[2],) or not np.all(np.isfinite(axis)):
         raise ValueError("axis must be finite and match per_frame bins")
@@ -730,8 +804,12 @@ def _position_accumulators(group):
 
 
 def refine_position_scales(
-    group, *, minimum_pixel_weight=100, minimum_overlap_bins=20, fractional_floor=0.003
-) -> dict:
+    group: Mapping[str, Any],
+    *,
+    minimum_pixel_weight: float = 100,
+    minimum_overlap_bins: int = 20,
+    fractional_floor: float = 0.003,
+) -> Payload:
     """Fit one positive intensity divisor per position from same-bin overlaps.
 
     ``group`` is a process_scan merged_2theta payload, integrated with UNITY
@@ -800,8 +878,8 @@ def refine_position_scales(
     valid &= np.isfinite(intensity) & (intensity > 0) & np.isfinite(relative_variance)
     log_intensity = np.zeros_like(intensity)
     np.log(intensity, out=log_intensity, where=valid)
-    edges = []
-    neighbors = [set() for _ in range(n_positions)]
+    edges: list[dict[str, Any]] = []
+    neighbors: list[set[int]] = [set() for _ in range(n_positions)]
     for i in range(n_positions):
         for j in range(i + 1, n_positions):
             with np.errstate(
@@ -831,12 +909,12 @@ def refine_position_scales(
             neighbors[i].add(j)
             neighbors[j].add(i)
 
-    components = []
+    components: list[list[int]] = []
     unseen = set(range(n_positions))
     while unseen:
         pending = [min(unseen)]
         unseen.remove(pending[0])
-        component = []
+        component: list[int] = []
         while pending:
             position = pending.pop()
             component.append(position)
@@ -847,7 +925,8 @@ def refine_position_scales(
     if len(components) != 1:
         unsupported = [i for i in range(n_positions) if not neighbors[i]]
         raise ValueError(
-            f"Disconnected overlap graph: components={components}; unsupported positions={unsupported}"
+            f"Disconnected overlap graph: components={components}; "
+            f"unsupported positions={unsupported}"
         )
 
     design = np.zeros((len(edges), n_positions))
@@ -870,7 +949,7 @@ def refine_position_scales(
     if not np.all(np.isfinite(gains) & (gains > 0)):
         raise ValueError("Overlap solution does not yield finite positive gains")
     residual = delta - design @ log_gains
-    for edge, after in zip(edges, residual):
+    for edge, after in zip(edges, residual, strict=True):
         edge.update({"residual_before": edge["delta"], "residual_after": float(after)})
     normalized_weights = weights / weights.max()
     normalized_weights /= normalized_weights.sum()
@@ -902,7 +981,7 @@ def refine_position_scales(
     }
 
 
-def apply_position_scales(processed, gains) -> dict:
+def apply_position_scales(processed: Mapping[str, Any], gains: ArrayLike) -> Payload:
     """Return a new processed payload with normalization multiplied by gains.
 
     The original processed frame_gains must be exactly unity, not merely close.
@@ -930,18 +1009,20 @@ def apply_position_scales(processed, gains) -> dict:
         raise ValueError("gains must be a nonempty finite positive 1D array")
     if original_gains.shape != gains.shape or not np.all(original_gains == 1.0):
         raise ValueError(
-            "Original frame_gains must be exactly unity and match gains length (no double application)"
+            "Original frame_gains must be exactly unity and match gains length "
+            "(no double application)"
         )
     if not isinstance(groups, dict) or not groups:
         raise ValueError("processed groups must be a nonempty dict")
-    updated_groups = {}
+    updated_groups: dict[str, Payload] = {}
     for name, group in groups.items():
         frames = _position_accumulators(group)
         if frames.shape[0] != gains.size:
             raise ValueError(f"{name}: position count must match gains length")
         if not np.all(np.isfinite(frames)) or np.any(frames[:, 1:] < 0):
             raise ValueError(
-                f"{name}: accumulators must be finite with nonnegative normalization, variance and count"
+                f"{name}: accumulators must be finite with nonnegative "
+                "normalization, variance and count"
             )
         scaled = frames.copy()
         with np.errstate(over="ignore", under="ignore", invalid="ignore"):
@@ -987,29 +1068,32 @@ def apply_position_scales(processed, gains) -> dict:
 
 
 def validate_response(
-    scan,
-    model,
-    cache,
-    fit,
-    test_indices,
-    base_mask,
-    q_range,
-    npt,
-    saturation=1e7,
+    scan: Scan,
+    model: PhysicalModel,
+    cache: Cache,
+    fit: Mapping[str, Any],
+    test_indices: Iterable[int | np.integer[Any]],
+    base_mask: BoolArray,
+    q_range: tuple[float, float],
+    npt: int,
+    saturation: float = 1e7,
     *,
-    validate_frame_gains=True,
-):
+    validate_frame_gains: bool = True,
+) -> Payload:
     """Compare responses, optionally inferring frame gains from lower-Q pixels.
 
     Disabling frame-gain validation removes the lower-Q support requirement
     and gain-corrected result; frame rows report unity gains. Higher-Q scoring
     uses the same cutoff and support requirements in either mode.
     """
-    results = {"physical_only": {}, "detector_only": {}}
+    results: dict[str, dict[int, Integrate1dResult]] = {
+        "physical_only": {},
+        "detector_only": {},
+    }
     if validate_frame_gains:
         results["lower_q_frame_gain"] = {}
-    high_q_scores = {label: [] for label in results}
-    frame_rows = []
+    high_q_scores: dict[str, list[float]] = {label: [] for label in results}
+    frame_rows: list[dict[str, Any]] = []
     step = (q_range[1] - q_range[0]) / npt
     with h5py.File(scan.detector_path, "r") as file:
         for index in test_indices:
@@ -1018,7 +1102,7 @@ def validate_response(
             bins = frame["bins"]
             cutoff = int(np.quantile(np.unique(bins), 0.4))
             inferred_gain = 1.0
-            variants = [
+            variants: list[tuple[str, FloatArray, float]] = [
                 ("physical_only", np.ones(scan.shape), 1.0),
                 ("detector_only", fit["combined_divisor"], 1.0),
             ]
@@ -1042,7 +1126,7 @@ def validate_response(
                 variants.append(
                     ("lower_q_frame_gain", fit["combined_divisor"], inferred_gain)
                 )
-            counts = file[scan.detector_dataset][index]
+            counts = h5_dataset(file, scan.detector_dataset)[index]
             for label, divisor, gain in variants:
                 result = integrate_frame(
                     model,
@@ -1059,7 +1143,7 @@ def validate_response(
                 results[label][index] = result
                 high = (
                     (np.arange(npt) > cutoff + 2)
-                    & (result.count >= 100)
+                    & (np.asarray(result.count) >= 100)
                     & (result.intensity > 0)
                     & fit["supported_q_bins"]
                 )
@@ -1086,7 +1170,9 @@ def validate_response(
     return {"summary": summary, "frame_rows": frame_rows, "results": results}
 
 
-def _tag_nxdata(group, signal_name, axes, interpretation):
+def _tag_nxdata(
+    group: h5py.Group, signal_name: str, axes: Sequence[str], interpretation: str
+) -> None:
     """Modern NeXus plot declarations plus legacy dataset tags for DAWN readers."""
     group.attrs["NX_class"] = "NXdata"
     group.attrs["signal"] = signal_name
@@ -1101,17 +1187,16 @@ def _tag_nxdata(group, signal_name, axes, interpretation):
         group[name].attrs["primary"] = 1
 
 
-def _tag_calibration_plot(file):
+def _tag_calibration_plot(file: h5py.File) -> None:
     """Link an NXentry default view to existing corrections without copying data."""
-    correction = file["corrections"]
+    correction = h5_group(file, "corrections")
     for dimension, name, label in (
         (0, "detector_row", "Detector row (pixel index)"),
         (1, "detector_column", "Detector column (pixel index)"),
     ):
         if name not in correction:
-            correction.create_dataset(
-                name, data=np.arange(correction["combined_divisor"].shape[dimension])
-            )
+            divisor = h5_dataset(correction, "combined_divisor")
+            correction.create_dataset(name, data=np.arange(divisor.shape[dimension]))
         correction[name].attrs["units"] = "1"
         correction[name].attrs["long_name"] = label
     _tag_nxdata(
@@ -1129,16 +1214,16 @@ def _tag_calibration_plot(file):
         entry["corrections"] = correction  # HDF5 hard link, not a second map.
 
 
-def _tag_pattern_plot(file):
+def _tag_pattern_plot(file: h5py.File) -> None:
     """Select intensity versus scattering coordinate and label conditional sigma."""
     file.attrs["default"] = "entry"
-    entry = file["entry"]
+    entry = h5_group(file, "entry")
     entry.attrs["NX_class"] = "NXentry"
     entry.attrs["default"] = "merged_2theta"
     for name in ("merged_2theta", "merged_q"):
         if name not in entry:
             continue
-        group = entry[name]
+        group = h5_group(entry, name)
         axis_name = "q_nm" if name == "merged_q" else "two_theta_deg"
         _tag_nxdata(group, "intensity", (axis_name,), "spectrum")
         group[axis_name].attrs["units"] = "nm^-1" if name == "merged_q" else "degrees"
@@ -1154,8 +1239,15 @@ def _tag_pattern_plot(file):
 
 
 def save_calibration(
-    path, scan, model, fit, base_mask, sensor_ids, fit_settings, validation
-):
+    path: str | Path,
+    scan: Scan,
+    model: PhysicalModel,
+    fit: Mapping[str, Any],
+    base_mask: BoolArray,
+    sensor_ids: IntArray,
+    fit_settings: Mapping[str, Any],
+    validation: object,
+) -> Path:
     # Persist the actual model selection even for callers other than the notebook.
     fit_settings = {
         **fit_settings,
@@ -1189,7 +1281,8 @@ def save_calibration(
         }.items():
             physical.attrs[name] = value
         physical.attrs["model"] = (
-            "absolute solid angle, pyFAI polarization, xraylib planar Beer-Lambert CdTe absorption; not measured detector QE"
+            "absolute solid angle, pyFAI polarization, xraylib planar "
+            "Beer-Lambert CdTe absorption; not measured detector QE"
         )
         correction = file.create_group("corrections")
         for name in (
@@ -1231,13 +1324,14 @@ def save_calibration(
     return path.resolve()
 
 
-def load_calibration(path):
+def load_calibration(path: str | Path) -> Payload:
     path = Path(path).resolve()
     with h5py.File(path, "r") as file:
         if file.attrs.get("schema") != SCHEMA:
             raise ValueError(f"Unsupported calibration schema; expected {SCHEMA}")
-        correction = file["corrections"]
-        payload = {
+        correction = h5_group(file, "corrections")
+        diagnostics = h5_group(file, "fit_diagnostics")
+        payload: Payload = {
             name: _array(correction, name)
             for name in (
                 "combined_divisor",
@@ -1252,13 +1346,13 @@ def load_calibration(path):
         payload.update(
             {
                 "path": path,
-                "geometry": json.loads(_text(file["geometry_json"][()])),
+                "geometry": json.loads(_text(h5_dataset(file, "geometry_json")[()])),
                 "physical": dict(file["physical"].attrs),
-                "fit_settings": json.loads(file.attrs["fit_settings_json"]),
+                "fit_settings": json.loads(_text(file.attrs["fit_settings_json"])),
                 "source_scan": _text(file.attrs["source_scan"]),
-                "frame_angles": _array(file["fit_diagnostics"], "frame_angles_deg"),
-                "frame_i0": _array(file["fit_diagnostics"], "frame_i0"),
-                "frame_gains": _array(file["fit_diagnostics"], "frame_gains"),
+                "frame_angles": _array(diagnostics, "frame_angles_deg"),
+                "frame_i0": _array(diagnostics, "frame_i0"),
+                "frame_gains": _array(diagnostics, "frame_gains"),
             }
         )
     divisor = payload["combined_divisor"]
@@ -1270,7 +1364,7 @@ def load_calibration(path):
     return payload
 
 
-def model_for_processing(scan, calibration):
+def model_for_processing(scan: Scan, calibration: Mapping[str, Any]) -> PhysicalModel:
     physical = calibration["physical"]
     for name, actual in (
         ("energy_kev", scan.energy_kev),
@@ -1279,7 +1373,8 @@ def model_for_processing(scan, calibration):
     ):
         if not np.isclose(actual, physical[name], rtol=1e-6, atol=0):
             raise ValueError(
-                f"Scan/calibration {name} mismatch; do not silently transfer this calibration"
+                f"Scan/calibration {name} mismatch; "
+                "do not silently transfer this calibration"
             )
     if (
         scan.material != _text(physical["material"])
@@ -1300,7 +1395,12 @@ def model_for_processing(scan, calibration):
     return model
 
 
-def theta_range_for_scan(scan, model, mask, theta_max=None):
+def theta_range_for_scan(
+    scan: Scan,
+    model: PhysicalModel,
+    mask: ArrayLike,
+    theta_max: float | None = None,
+) -> tuple[float, float]:
     """Return (0, maximum) 2theta degrees without reading detector counts.
 
     The automatic maximum uses finite, unmasked pyFAI pixel centres over all
@@ -1337,24 +1437,28 @@ def theta_range_for_scan(scan, model, mask, theta_max=None):
 
 
 def process_scan(
-    scan,
-    calibration,
-    model,
-    q_range=(200, 400),
-    q_npt=800,
-    theta_npt=1000,
-    apply_calibration_frame_gains=False,
-    allow_extrapolation=True,
-    saturation=1e7,
-    theta_range=None,
-):
+    scan: Scan,
+    calibration: Mapping[str, Any],
+    model: PhysicalModel,
+    q_range: tuple[float, float] = (200, 400),
+    q_npt: int = 800,
+    theta_npt: int = 1000,
+    apply_calibration_frame_gains: bool = False,
+    allow_extrapolation: bool = True,
+    saturation: float = 1e7,
+    theta_range: tuple[float, float] | None = None,
+) -> Payload:
     """Integrate with optional explicit (lower, upper) 2theta limits in degrees.
 
     None starts at zero and uses the maximum unmasked pyFAI pixel centre.
     Explicit (lower, upper) tuples remain supported for existing callers.
     """
+    theta_limits: tuple[float, float] | None = None
     if theta_range is not None:
-        message = "theta_range must be a finite (lower, upper) tuple with 0 <= lower < upper <= 180 degrees"
+        message = (
+            "theta_range must be a finite (lower, upper) tuple "
+            "with 0 <= lower < upper <= 180 degrees"
+        )
         if not isinstance(theta_range, tuple) or len(theta_range) != 2:
             raise ValueError(message)
         try:
@@ -1367,11 +1471,12 @@ def process_scan(
             or not 0 <= limits[0] < limits[1] <= 180
         ):
             raise ValueError(message)
-        lower, upper = map(float, limits)
+        theta_limits = (float(limits[0]), float(limits[1]))
     fit_range = calibration["fit_settings"]["q_range"]
     if not allow_extrapolation:
         raise ValueError(
-            "Full-range 2theta export extrapolates the fitted detector response; explicitly enable allow_extrapolation"
+            "Full-range 2theta export extrapolates the fitted detector response; "
+            "explicitly enable allow_extrapolation"
         )
     gains = np.ones(len(scan.angles))
     if apply_calibration_frame_gains:
@@ -1388,15 +1493,18 @@ def process_scan(
         | calibration["bad_pixel_mask"].astype(bool)
         | scan.native_mask
     )
-    if theta_range is None:
-        lower, upper = theta_range_for_scan(scan, model, mask)
-    results = {"merged_q": {}, "merged_2theta": {}}
+    if theta_limits is None:
+        theta_limits = theta_range_for_scan(scan, model, mask)
+    results: dict[str, dict[int, Integrate1dResult]] = {
+        "merged_q": {},
+        "merged_2theta": {},
+    }
     with h5py.File(scan.detector_path, "r") as file:
         for index, angle in enumerate(scan.angles):
-            counts = file[scan.detector_dataset][index]
+            counts = h5_dataset(file, scan.detector_dataset)[index]
             for name, npt, radial_range, unit in (
                 ("merged_q", q_npt, q_range, "q_nm^-1"),
-                ("merged_2theta", theta_npt, (lower, upper), "2th_deg"),
+                ("merged_2theta", theta_npt, theta_limits, "2th_deg"),
             ):
                 results[name][index] = integrate_frame(
                     model,
@@ -1458,7 +1566,13 @@ def process_scan(
     }
 
 
-def save_processed(path, scan, calibration, model, processed):
+def save_processed(
+    path: str | Path,
+    scan: Scan,
+    calibration: Mapping[str, Any],
+    model: PhysicalModel,
+    processed: Mapping[str, Any],
+) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(path, "x") as file:
@@ -1516,7 +1630,8 @@ def save_processed(path, scan, calibration, model, processed):
             processed.get("azimuth_range_deg")
         )
         correction.attrs["azimuth_mask_convention"] = (
-            "pyFAI chi degrees; inclusive pixel-centre wedge evaluated per motor position"
+            "pyFAI chi degrees; inclusive pixel-centre wedge "
+            "evaluated per motor position"
         )
         correction.attrs["source_calibration_scan"] = calibration["source_scan"]
         physical = entry.create_group("physical_corrections")
@@ -1527,16 +1642,14 @@ def save_processed(path, scan, calibration, model, processed):
         _tag_pattern_plot(file)
     with h5py.File(path, "r") as file:
         for name, payload in processed["groups"].items():
-            group = file[f"entry/{name}"]
-            np.testing.assert_allclose(
-                group["intensity"][()], payload["intensity"], equal_nan=True
-            )
-            np.testing.assert_allclose(
-                group["sigma"][()], payload["sigma"], equal_nan=True
-            )
+            group = h5_group(file, f"entry/{name}")
+            intensity = _array(group, "intensity")
+            sigma = _array(group, "sigma")
+            np.testing.assert_allclose(intensity, payload["intensity"], equal_nan=True)
+            np.testing.assert_allclose(sigma, payload["sigma"], equal_nan=True)
             totals = np.array(
                 [
-                    group[field][()]
+                    _array(group, field)
                     for field in (
                         "sum_signal",
                         "sum_normalization",
@@ -1546,20 +1659,20 @@ def save_processed(path, scan, calibration, model, processed):
                 ]
             )
             np.testing.assert_allclose(
-                group["frame_accumulators"][()].sum(axis=0), totals
+                _array(group, "frame_accumulators").sum(axis=0), totals
             )
             valid = totals[1] > 0
             np.testing.assert_allclose(
-                group["intensity"][()][valid], totals[0, valid] / totals[1, valid]
+                intensity[valid], totals[0, valid] / totals[1, valid]
             )
             np.testing.assert_allclose(
-                group["sigma"][()][valid], np.sqrt(totals[2, valid]) / totals[1, valid]
+                sigma[valid], np.sqrt(totals[2, valid]) / totals[1, valid]
             )
             np.testing.assert_array_equal(
-                group["frame_intensity_gains"][()], processed["frame_gains"]
+                _array(group, "frame_intensity_gains"), processed["frame_gains"]
             )
         np.testing.assert_array_equal(
-            file["entry/calibration/combined_divisor"][()],
+            _array(file, "entry/calibration/combined_divisor"),
             calibration["combined_divisor"],
         )
     return path.resolve()

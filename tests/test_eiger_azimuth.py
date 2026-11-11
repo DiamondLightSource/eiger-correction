@@ -2,11 +2,17 @@
 
 import unittest
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import numpy as np
 
 import eiger_correction.eiger_workflow as workflow
+
+
+def stub(**attributes: Any) -> Any:
+    """Stand-in for Scan or PhysicalModel."""
+    return SimpleNamespace(**attributes)
 
 
 class AzimuthTests(unittest.TestCase):
@@ -23,12 +29,12 @@ class AzimuthTests(unittest.TestCase):
                 self.assertEqual(unit, "2th_rad")
                 return np.deg2rad(np.arange(chi.size).reshape(shape) + 1.0)
 
-            return SimpleNamespace(center_array=center_array)
+            return stub(center_array=center_array)
 
-        model = SimpleNamespace(
+        model = stub(
             shape=shape,
             azimuth_range=limits,
-            geometry=SimpleNamespace(get_ai=get_ai),
+            geometry=stub(get_ai=get_ai),
             polarization=0.95,
         )
         model.arrays = lambda angle: (
@@ -64,8 +70,8 @@ class AzimuthTests(unittest.TestCase):
 
     def test_none_and_legacy_model_need_no_geometry(self):
         for model in (
-            SimpleNamespace(shape=(2, 3)),
-            SimpleNamespace(shape=(2, 3), azimuth_range=None),
+            stub(shape=(2, 3)),
+            stub(shape=(2, 3), azimuth_range=None),
         ):
             np.testing.assert_array_equal(
                 workflow.azimuth_mask(model, 123), np.zeros((2, 3), dtype=bool)
@@ -97,7 +103,7 @@ class AzimuthTests(unittest.TestCase):
                 for angle in range(4)
             }
         )
-        scan = SimpleNamespace(
+        scan = stub(
             angles=np.arange(4.0),
             i0=np.ones(4),
             detector_path="unused.h5",
@@ -159,7 +165,7 @@ class AzimuthTests(unittest.TestCase):
 
     def test_automatic_theta_max_obeys_per_position_wedge(self):
         model = self.model({0.0: [[90.0, 0.0, 0.0]], 40.0: [[0.0, 90.0, 0.0]]})
-        scan = SimpleNamespace(shape=model.shape, angles=np.array([0.0, 40.0]))
+        scan = stub(shape=model.shape, angles=np.array([0.0, 40.0]))
         limits = workflow.theta_range_for_scan(scan, model, np.zeros(model.shape, bool))
         np.testing.assert_allclose(limits, (0.0, 2.0))
         model.azimuth_range = None
@@ -171,7 +177,7 @@ class AzimuthTests(unittest.TestCase):
     def test_processing_masks_both_axes_and_keeps_metadata(self):
         model = self.model({0.0: [[90.0, 0.0]], 40.0: [[0.0, 90.0]]})
         model.geometry.wavelength = 1e-11
-        scan = SimpleNamespace(
+        scan = stub(
             shape=model.shape,
             angles=np.array([0.0, 40.0]),
             i0=np.ones(2),
@@ -188,7 +194,7 @@ class AzimuthTests(unittest.TestCase):
 
         def integrate(counts, npt, **kwargs):
             kept = ~kwargs["mask"]
-            return SimpleNamespace(
+            return stub(
                 radial=np.arange(npt, dtype=float),
                 sum_signal=np.full(npt, counts[kept].sum()),
                 sum_normalization=np.full(npt, kept.sum(), dtype=float),
@@ -220,7 +226,7 @@ class AzimuthTests(unittest.TestCase):
         self.assertEqual(scaled["azimuth_range_deg"], (67.5, 112.5))
 
     def test_calibration_reload_restores_wedge_and_legacy_default(self):
-        scan = SimpleNamespace(
+        scan = stub(
             energy_kev=80.0,
             thickness_m=0.001,
             wavelength_m=1e-11,

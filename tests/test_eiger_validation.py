@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import numpy as np
@@ -9,11 +10,16 @@ import numpy as np
 import eiger_correction.eiger_workflow as workflow
 
 
+def stub(**attributes: Any) -> Any:
+    """Stand-in for Scan or PhysicalModel."""
+    return SimpleNamespace(**attributes)
+
+
 class ValidationTests(unittest.TestCase):
     def setUp(self):
         self.npt = 32
         self.shape = (8, self.npt)
-        self.scan = SimpleNamespace(
+        self.scan = stub(
             detector_path="unused.h5",
             detector_dataset="data",
             shape=self.shape,
@@ -39,7 +45,7 @@ class ValidationTests(unittest.TestCase):
     def validate(self, **kwargs):
         return workflow.validate_response(
             self.scan,
-            None,
+            stub(),  # model is unused: integrate_frame is patched
             self.cache,
             self.fit,
             [0, 1],
@@ -50,7 +56,7 @@ class ValidationTests(unittest.TestCase):
         )
 
     def integration(self, *args, frame_gain, **kwargs):
-        return SimpleNamespace(
+        return stub(
             intensity=np.full(self.npt, np.exp(0.02) / frame_gain),
             count=np.full(self.npt, 100),
         )
@@ -60,7 +66,7 @@ class ValidationTests(unittest.TestCase):
         self.cache = {index: {"bins": np.arange(self.npt)} for index in range(2)}
         intensity = np.ones(self.npt)
         intensity[:15] = 9.0  # Must not contaminate the higher-Q score.
-        result = SimpleNamespace(intensity=intensity, count=np.full(self.npt, 100))
+        result = stub(intensity=intensity, count=np.full(self.npt, 100))
         with (
             patch.object(workflow.h5py, "File") as source,
             patch.object(workflow, "integrate_frame", return_value=result) as integrate,

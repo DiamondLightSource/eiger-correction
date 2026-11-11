@@ -16,7 +16,8 @@ import warnings
 from contextlib import ExitStack, redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from typing import Any, cast
+from unittest.mock import MagicMock, patch
 
 import h5py
 import numpy as np
@@ -24,6 +25,12 @@ import numpy as np
 import eiger_correction.eiger_diagnostics as diagnostics
 import eiger_correction.eiger_workflow as workflow
 import eiger_correction.extract_eiger_corrections as cli
+from eiger_correction.eiger_workflow import h5_dataset, h5_group
+
+
+def stub(**attributes: Any) -> Any:
+    """Stand-in for Scan or PhysicalModel."""
+    return SimpleNamespace(**attributes)
 
 
 def strict_json(path):
@@ -117,7 +124,7 @@ class ArgumentTests(TemporaryCase):
             {"theta_max": 180.0, "polarization": 1.0, "fit_bins": 65535},
         ):
             with self.subTest(values=values):
-                cli.check_arguments(SimpleNamespace(**{**vars(args), **values}))
+                cli.check_arguments(stub(**{**vars(args), **values}))
 
     def test_parser_rejects_missing_or_malformed_arguments(self):
         cases = [
@@ -166,7 +173,7 @@ class ArgumentTests(TemporaryCase):
                     self.subTest(field=field, value=value),
                     self.assertRaises(ValueError),
                 ):
-                    cli.check_arguments(SimpleNamespace(**{**vars(args), field: value}))
+                    cli.check_arguments(stub(**{**vars(args), field: value}))
 
     def test_azimuth_invalids_use_workflow_validation(self):
         for wedge in ((0, 0), (0, 361), (0, -361), (np.nan, 20), (10, np.inf), (10,)):
@@ -192,7 +199,7 @@ class LifecycleTests(TemporaryCase):
             handlers = list(logging.getLogger().handlers)
             warning_hook = warnings.showwarning
 
-            def extraction(args, output, record):
+            def extraction(args, output, record, emit_warning=emit_warning):
                 with record.stage("synthetic"):
                     print("stdout marker")
                     print("stderr marker", file=sys.stderr)
@@ -203,7 +210,7 @@ class LifecycleTests(TemporaryCase):
                         "path": output,
                     }
                     if emit_warning:
-                        warnings.warn("synthetic warning", RuntimeWarning)
+                        warnings.warn("synthetic warning", RuntimeWarning, stacklevel=2)
 
             with patch.object(cli, "extract", side_effect=extraction):
                 self.assertEqual(cli.main(self.argv(directory)), 0)
@@ -249,13 +256,15 @@ class LifecycleTests(TemporaryCase):
             handlers = list(logging.getLogger().handlers)
             warning_hook = warnings.showwarning
 
-            def extraction(args, output, record):
+            def extraction(args, output, record, error=error):
                 with tempfile.TemporaryDirectory(
                     dir=output, prefix=".grouped_"
                 ) as temporary:
                     Path(temporary, "frames.h5").touch()
                     with record.stage("integration"):
-                        warnings.warn("warning before failure", UserWarning)
+                        warnings.warn(
+                            "warning before failure", UserWarning, stacklevel=2
+                        )
                         raise error
 
             with patch.object(cli, "extract", side_effect=extraction):
@@ -497,7 +506,7 @@ class ThetaIntegrationTests(TemporaryCase):
         native[1, 2] = True
         azimuth = np.zeros(shape, dtype=bool)
         azimuth[1, 3] = True
-        scan = SimpleNamespace(
+        scan = stub(
             angles=np.array([1.0, 2.0, 3.0]),
             i0=np.array([10.0, 20.0, 30.0]),
             shape=shape,
@@ -505,15 +514,15 @@ class ThetaIntegrationTests(TemporaryCase):
             detector_path=path,
             detector_dataset="data",
         )
-        ai = SimpleNamespace(center_array=lambda shape, unit: np.deg2rad(theta))
-        model = SimpleNamespace(
-            geometry=SimpleNamespace(get_ai=lambda angle: ai, wavelength=1e-10),
+        ai = stub(center_array=lambda shape, unit: np.deg2rad(theta))
+        model = stub(
+            geometry=stub(get_ai=lambda angle: ai, wavelength=1e-10),
             azimuth_range=(67.5, 112.5),
         )
         axis = np.arange(15.0, 60.0, 10.0)
 
         def integration(*args, **kwargs):
-            return SimpleNamespace(
+            return stub(
                 radial=axis,
                 sum_signal=np.full(5, 10.0),
                 sum_normalization=np.ones(5),
@@ -573,19 +582,15 @@ class DiagnosticSmokeTests(TemporaryCase):
         unity = processed_payload()
         shape = unity["mask"].shape
         fit = response_fit(shape)
-        scan = SimpleNamespace(
+        scan = stub(
             angles=np.array([5.0, 15.0, 25.0, 35.0]),
             i0=np.array([2.0, 3.0, 4.0, 5.0]),
             ring_current=np.array([280.0, 279.0, 278.0, 277.0]),
             shape=shape,
         )
-        raw = SimpleNamespace(
-            angles=np.repeat(scan.angles, 2), i0=np.repeat(scan.i0 / 2, 2)
-        )
+        raw = stub(angles=np.repeat(scan.angles, 2), i0=np.repeat(scan.i0 / 2, 2))
         groups = [np.array([2 * i, 2 * i + 1]) for i in range(4)]
-        model = SimpleNamespace(
-            geometry=SimpleNamespace(wavelength=1e-10), azimuth_range=(67.5, 112.5)
-        )
+        model = stub(geometry=stub(wavelength=1e-10), azimuth_range=(67.5, 112.5))
         gains = np.exp(np.array([-0.03, -0.01, 0.01, 0.03]))
         final = workflow.apply_position_scales(unity, gains)
         scale = {
@@ -652,7 +657,7 @@ class DiagnosticSmokeTests(TemporaryCase):
             final["groups"]["merged_2theta"]
         )
         for row, residuals in zip(
-            summary["residuals"]["final"], expected_residuals["residual"]
+            summary["residuals"]["final"], expected_residuals["residual"], strict=True
         ):
             self.assertAlmostEqual(row["mean_percent"], float(np.mean(residuals)))
 
@@ -697,7 +702,7 @@ class SyntheticExtractionTests(TemporaryCase):
         with h5py.File(raw.path, "x") as source:
             source["entry/instrument/synchrotron/current"] = np.full(8, 300.0)
         (self.root / "geometry.json").write_text("{}")
-        model = SimpleNamespace(
+        model = stub(
             config={},
             polarization=0.95,
             density=6.2,
@@ -708,7 +713,7 @@ class SyntheticExtractionTests(TemporaryCase):
             transmission=0.8,
             efficiency=0.2,
             azimuth_range=(67.5, 112.5),
-            geometry=SimpleNamespace(wavelength=1e-10),
+            geometry=stub(wavelength=1e-10),
             vertical_check=lambda: {"passed": True},
         )
         groups = [np.array([2 * i, 2 * i + 1]) for i in range(4)]
@@ -778,36 +783,38 @@ class SyntheticExtractionTests(TemporaryCase):
             )
         self.assert_exports(directory, code, unity, fit)
         with h5py.File(directory / "pattern.h5", "r") as target:
-            entry = target[target.attrs["default"]]
+            entry = h5_group(target, str(target.attrs["default"]))
             self.assertEqual(entry.attrs["NX_class"], "NXentry")
-            group = entry[entry.attrs["default"]]
+            group = h5_group(entry, str(entry.attrs["default"]))
             self.assertEqual(group.name, "/entry/merged_2theta")
             self.assertEqual(group.attrs["NX_class"], "NXdata")
             self.assertEqual(group.attrs["signal"], "intensity")
-            self.assertEqual(list(group.attrs["axes"]), ["two_theta_deg"])
+            self.assertEqual(
+                np.asarray(group.attrs["axes"]).tolist(), ["two_theta_deg"]
+            )
             self.assertEqual(group.attrs["two_theta_deg_indices"], 0)
             self.assertEqual(group["two_theta_deg"].attrs["units"], "degrees")
             self.assertEqual(group["intensity"].attrs["interpretation"], "spectrum")
             self.assertEqual(group["intensity"].attrs["signal"], 1)
             self.assertEqual(group["intensity_errors"].id, group["sigma"].id)
         with h5py.File(directory / "detector_corrections.h5", "r") as target:
-            entry = target[target.attrs["default"]]
+            entry = h5_group(target, str(target.attrs["default"]))
             self.assertEqual(entry.attrs["NX_class"], "NXentry")
-            group = entry[entry.attrs["default"]]
+            group = h5_group(entry, str(entry.attrs["default"]))
             self.assertEqual(group.id, target["corrections"].id)
             self.assertEqual(group.attrs["NX_class"], "NXdata")
             self.assertEqual(group.attrs["signal"], "combined_divisor")
-            self.assertEqual(
-                list(group.attrs["axes"]), ["detector_row", "detector_column"]
-            )
-            signal = group[group.attrs["signal"]]
+            axes = np.asarray(group.attrs["axes"]).tolist()
+            self.assertEqual(axes, ["detector_row", "detector_column"])
+            signal = h5_dataset(group, str(group.attrs["signal"]))
             self.assertEqual(signal.attrs["interpretation"], "image")
             self.assertEqual(signal.id, target["corrections/combined_divisor"].id)
-            for dimension, axis in enumerate(group.attrs["axes"]):
+            for dimension, axis in enumerate(axes):
                 self.assertEqual(group.attrs[f"{axis}_indices"], dimension)
-                self.assertEqual(group[axis].shape, (signal.shape[dimension],))
+                axis_values = h5_dataset(group, axis)
+                self.assertEqual(axis_values.shape, (signal.shape[dimension],))
                 np.testing.assert_array_equal(
-                    group[axis][()], np.arange(signal.shape[dimension])
+                    axis_values[()], np.arange(signal.shape[dimension])
                 )
 
     def test_end_to_end_uses_embedded_geometry_by_default(self):
@@ -829,7 +836,8 @@ class SyntheticExtractionTests(TemporaryCase):
             option = argv.index("--geometry")
             del argv[option : option + 2]
             code = cli.main(argv)
-            self.assertEqual(workflow.PhysicalModel.call_args.args[0], config)
+            factory = cast(MagicMock, workflow.PhysicalModel)
+            self.assertEqual(factory.call_args.args[0], config)
         self.assert_exports(directory, code, unity, fit)
         report = strict_json(directory / "report.json")
         self.assertEqual(report["inputs"]["geometry_source"], "nexus")
@@ -895,17 +903,22 @@ class SyntheticExtractionTests(TemporaryCase):
             "groups"
         ]["merged_2theta"]
         with h5py.File(directory / "pattern.h5", "r") as target:
-            group = target["entry/merged_2theta"]
-            np.testing.assert_allclose(group["intensity"][()], expected["intensity"])
+            group = h5_group(target, "entry/merged_2theta")
             np.testing.assert_allclose(
-                group["frame_accumulators"][()].sum(axis=0), expected["accumulators"]
+                h5_dataset(group, "intensity")[()], expected["intensity"]
+            )
+            np.testing.assert_allclose(
+                h5_dataset(group, "frame_accumulators")[()].sum(axis=0),
+                expected["accumulators"],
             )
         xy = np.loadtxt(directory / "pattern_2theta.xy")
         np.testing.assert_allclose(xy[:, 0], expected["axis"], rtol=6e-10)
         np.testing.assert_allclose(xy[:, 1], expected["intensity"], rtol=6e-10)
         with h5py.File(directory / "detector_corrections.h5", "r") as target:
             np.testing.assert_array_equal(
-                target["fit_diagnostics/detector_fit_nuisance_frame_gains"][()],
+                h5_dataset(target, "fit_diagnostics/detector_fit_nuisance_frame_gains")[
+                    ()
+                ],
                 fit["frame_gains"],
             )
 

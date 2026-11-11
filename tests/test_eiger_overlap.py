@@ -107,7 +107,7 @@ class RefinePositionScalesTests(unittest.TestCase):
         result = workflow.refine_position_scales(group, fractional_floor=0.01)
         incidence = np.array([[1.0, -1.0, 0.0], [1.0, 0.0, -1.0], [0.0, 1.0, -1.0]])
         deltas, weights = [], []
-        for edge, (i, j) in zip(result["edges"], [(0, 1), (0, 2), (1, 2)]):
+        for edge, (i, j) in zip(result["edges"], [(0, 1), (0, 2), (1, 2)], strict=True):
             signal, norm, variance = frames[:, 0], frames[:, 1], frames[:, 2]
             w = 1 / (
                 variance[i] / signal[i] ** 2 + variance[j] / signal[j] ** 2 + 0.01**2

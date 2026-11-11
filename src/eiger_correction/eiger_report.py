@@ -2,21 +2,30 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 
-def _text(value):
+def _text(value: object) -> str:
     if value is None:
         return "—"
     if isinstance(value, float):
         return f"{value:,.6g}"
     if isinstance(value, (list, tuple)):
         return ", ".join(_text(item) for item in value)
-    return str(value).replace("\n", " ").replace("\r", " ").replace("|", "\\|").replace("<", "&lt;").replace(">", "&gt;")
+    return (
+        str(value)
+        .replace("\n", " ")
+        .replace("\r", " ")
+        .replace("|", "\\|")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
 
 
-def render_markdown(record):
+def render_markdown(record: Mapping[str, Any]) -> str:
     """Render a JSON-safe record, including partial/failed runs, without I/O.
 
     Large machine-facing arrays, hashes and graph edges stay in report.json.
@@ -24,16 +33,18 @@ def render_markdown(record):
     """
     lines = ["# EIGER extraction report", ""]
 
-    def paragraph(text):
+    def paragraph(text: str) -> None:
         lines.extend([text, ""])
 
-    def section(title):
+    def section(title: str) -> None:
         lines.extend([f"## {title}", ""])
 
-    def table(headers, rows):
+    def table(headers: Sequence[str], rows: Iterable[Iterable[object]]) -> None:
         lines.append("| " + " | ".join(headers) + " |")
         lines.append("| " + " | ".join("---" for _ in headers) + " |")
-        lines.extend("| " + " | ".join(_text(value) for value in row) + " |" for row in rows)
+        lines.extend(
+            "| " + " | ".join(_text(value) for value in row) + " |" for row in rows
+        )
         lines.append("")
 
     args = record.get("arguments", {})
@@ -45,23 +56,41 @@ def render_markdown(record):
     status = record.get("status", "unknown")
     paragraph(f"**Status: {_text(status).replace('_', ' ').upper()}**")
     if status == "running":
-        paragraph("This is a checkpoint, not a completed result. If the process has stopped, this record may be incomplete.")
+        paragraph(
+            "This is a checkpoint, not a completed result. "
+            "If the process has stopped, this record may be incomplete."
+        )
     elif status in ("failed", "interrupted"):
-        paragraph("**Do not accept partial outputs from this run.** See the failure details below.")
+        paragraph(
+            "**Do not accept partial outputs from this run.** "
+            "See the failure details below."
+        )
     paragraph("[Machine-readable record](report.json) · [Full process log](run.log)")
-    table(["Run", "Value"], [
-        ("Source scan", inputs.get("scan", args.get("scan"))),
-        ("Geometry source", inputs.get("geometry_source")),
-        ("Geometry calibration", inputs.get("geometry", args.get("geometry"))),
-        ("Started (UTC)", record.get("started_utc")),
-        ("Finished (UTC)", record.get("finished_utc")),
-        ("Elapsed (seconds)", record.get("elapsed_seconds")),
-        ("Latest stage", record.get("current_stage")),
-        ("Raw frames → analysis positions", f"{inputs.get('raw_frames', '—')} → {aggregation.get('positions', '—')}"),
-        ("Exported 2theta range (degrees)", record.get("theta_range_deg")),
-        ("Supported / unsupported bins", f"{integrity.get('supported_bins', '—')} / {integrity.get('unsupported_bins', '—')}"),
-        ("Overlap graph: positions / edges / components", f"{graph.get('n_positions', '—')} / {graph.get('n_edges', '—')} / {graph.get('n_components', '—')}"),
-    ])
+    frames = f"{inputs.get('raw_frames', '—')} → {aggregation.get('positions', '—')}"
+    bins = (
+        f"{integrity.get('supported_bins', '—')} / "
+        f"{integrity.get('unsupported_bins', '—')}"
+    )
+    graph_size = (
+        f"{graph.get('n_positions', '—')} / {graph.get('n_edges', '—')} / "
+        f"{graph.get('n_components', '—')}"
+    )
+    table(
+        ["Run", "Value"],
+        [
+            ("Source scan", inputs.get("scan", args.get("scan"))),
+            ("Geometry source", inputs.get("geometry_source")),
+            ("Geometry calibration", inputs.get("geometry", args.get("geometry"))),
+            ("Started (UTC)", record.get("started_utc")),
+            ("Finished (UTC)", record.get("finished_utc")),
+            ("Elapsed (seconds)", record.get("elapsed_seconds")),
+            ("Latest stage", record.get("current_stage")),
+            ("Raw frames → analysis positions", frames),
+            ("Exported 2theta range (degrees)", record.get("theta_range_deg")),
+            ("Supported / unsupported bins", bins),
+            ("Overlap graph: positions / edges / components", graph_size),
+        ],
+    )
 
     section("Warnings and interpretation")
     messages = record.get("warnings", [])
@@ -70,8 +99,19 @@ def render_markdown(record):
             lines.append(f"- {_text(message)}")
         lines.append("")
     else:
-        paragraph("No warnings recorded so far." if status == "running" else "No warnings recorded.")
-    paragraph(_text(record.get("validation_scope", "Stage-2 overlap residuals are in-sample, not independent validation.")))
+        paragraph(
+            "No warnings recorded so far."
+            if status == "running"
+            else "No warnings recorded."
+        )
+    paragraph(
+        _text(
+            record.get(
+                "validation_scope",
+                "Stage-2 overlap residuals are in-sample, not independent validation.",
+            )
+        )
+    )
     for limitation in record.get("limitations", []):
         lines.append(f"- {_text(limitation)}")
     lines.append("")
@@ -88,50 +128,116 @@ def render_markdown(record):
         paragraph(f"{fence}text\n{trace.rstrip()}\n{fence}")
 
     section("Validation")
-    table(["Check", "Result"], [
-        ("Validation mode", args.get("validation")),
-        ("Integrity checks", integrity.get("status", "not yet recorded")),
-        ("Constant-pattern normalization", record.get("geometry_checks", {}).get("constant_pattern", "not yet recorded")),
-        ("Independent raw-group audit", record.get("raw_audit", {}).get("status", "not yet recorded")),
-    ])
+    table(
+        ["Check", "Result"],
+        [
+            ("Validation mode", args.get("validation")),
+            ("Integrity checks", integrity.get("status", "not yet recorded")),
+            (
+                "Constant-pattern normalization",
+                record.get("geometry_checks", {}).get(
+                    "constant_pattern", "not yet recorded"
+                ),
+            ),
+            (
+                "Independent raw-group audit",
+                record.get("raw_audit", {}).get("status", "not yet recorded"),
+            ),
+        ],
+    )
     folds = record.get("held_out_validation", [])
     if folds:
-        paragraph("Held-out detector results (percent; smaller discrepancies indicate closer agreement, not certified accuracy):")
-        table(["Fold", "Correction", "Centered overlap (%)", "Absolute overlap (%)", "Higher-Q RMS (%)"], [
-            (fold.get("fold"), metric.get("label"), metric.get("centered_overlap_percent"),
-             metric.get("absolute_overlap_percent"), metric.get("higher_q_rms_percent"))
-            for fold in folds for metric in fold.get("metrics", [])
-        ])
-        table(["Fold", "Training positions", "Held-out positions", "Infer test gains from lower Q"], [
-            (fold.get("fold"), len(fold.get("train_positions", [])), len(fold.get("test_positions", [])),
-             fold.get("validate_frame_gains")) for fold in folds
-        ])
+        paragraph(
+            "Held-out detector results (percent; smaller discrepancies indicate "
+            "closer agreement, not certified accuracy):"
+        )
+        table(
+            [
+                "Fold",
+                "Correction",
+                "Centered overlap (%)",
+                "Absolute overlap (%)",
+                "Higher-Q RMS (%)",
+            ],
+            [
+                (
+                    fold.get("fold"),
+                    metric.get("label"),
+                    metric.get("centered_overlap_percent"),
+                    metric.get("absolute_overlap_percent"),
+                    metric.get("higher_q_rms_percent"),
+                )
+                for fold in folds
+                for metric in fold.get("metrics", [])
+            ],
+        )
+        table(
+            [
+                "Fold",
+                "Training positions",
+                "Held-out positions",
+                "Infer test gains from lower Q",
+            ],
+            [
+                (
+                    fold.get("fold"),
+                    len(fold.get("train_positions", [])),
+                    len(fold.get("test_positions", [])),
+                    fold.get("validate_frame_gains"),
+                )
+                for fold in folds
+            ],
+        )
     else:
-        paragraph("No held-out results recorded. Basic validation does not include independent detector folds; running/failed records may be incomplete.")
+        paragraph(
+            "No held-out results recorded. Basic validation does not include "
+            "independent detector folds; running/failed records may be incomplete."
+        )
     if graph:
-        table(["Stage-2 descriptive quantity", "Value"], [
-            ("Weighted edge log-ratio RMS before", graph.get("weighted_edge_rms_before")),
-            ("Weighted edge log-ratio RMS after", graph.get("weighted_edge_rms_after")),
-            ("Gauge", graph.get("gauge")),
-        ])
-        paragraph("These graph RMS values are in natural-log units, are in-sample and are not calibrated uncertainties.")
+        table(
+            ["Stage-2 descriptive quantity", "Value"],
+            [
+                (
+                    "Weighted edge log-ratio RMS before",
+                    graph.get("weighted_edge_rms_before"),
+                ),
+                (
+                    "Weighted edge log-ratio RMS after",
+                    graph.get("weighted_edge_rms_after"),
+                ),
+                ("Gauge", graph.get("gauge")),
+            ],
+        )
+        paragraph(
+            "These graph RMS values are in natural-log units, are in-sample "
+            "and are not calibrated uncertainties."
+        )
 
     section("Stage timings")
-    table(["Stage", "Status", "Seconds"], [
-        (name.replace("_", " "), stage.get("status"), stage.get("seconds"))
-        for name, stage in record.get("stages", {}).items()
-    ])
+    table(
+        ["Stage", "Status", "Seconds"],
+        [
+            (name.replace("_", " "), stage.get("status"), stage.get("seconds"))
+            for name, stage in record.get("stages", {}).items()
+        ],
+    )
 
     section("Outputs")
     outputs = record.get("outputs", {})
     for name, filename in outputs.items():
-        lines.append(f"- {_text(name.replace('_', ' ').capitalize())}: [{_text(filename)}]({quote(str(filename), safe='/')})")
+        label = _text(name.replace("_", " ").capitalize())
+        target = quote(str(filename), safe="/")
+        lines.append(f"- {label}: [{_text(filename)}]({target})")
     if not outputs:
         lines.append("No completed exports recorded yet.")
     lines.append("")
 
     section("Diagnostic images")
-    paragraph("Images are embedded below; select the filename link to open the full-size JPEG. Relative links remain valid when this run directory is moved as a unit.")
+    paragraph(
+        "Images are embedded below; select the filename link to open the "
+        "full-size JPEG. Relative links remain valid when this run directory "
+        "is moved as a unit."
+    )
     titles = {
         "angle_grouping": "Angle grouping and repeat counts",
         "azimuth_geometry": "Per-position azimuth mask — geometry only",
@@ -139,36 +245,56 @@ def render_markdown(record):
         "sampling_q": "Count-valid sampling and position coverage",
         "position_gains": "Stage-1 nuisance gains versus final position divisors",
         "final_xy": "Final intensity pattern — full range and high-angle zoom",
-        "overlap_final_abcd": "Position curves and overlap residuals after final gains (in-sample)",
+        "overlap_final_abcd": (
+            "Position curves and overlap residuals after final gains (in-sample)"
+        ),
     }
     for filename in diagnostic.get("figures", []):
         title = titles.get(Path(filename).stem, Path(filename).stem.replace("_", " "))
         target = quote(str(filename), safe="/")
-        paragraph(f"### {_text(title)}\n\n[{_text(filename)}]({target})\n\n![{title}]({target})")
+        paragraph(
+            f"### {_text(title)}\n\n"
+            f"[{_text(filename)}]({target})\n\n"
+            f"![{title}]({target})"
+        )
         if Path(filename).stem == "overlap_final_abcd":
-            paragraph("**Low-support spikes:** individual-position curves can spike where very few pixels contribute, "
-                      "especially near coverage edges. Panel A includes all supported bins; panel B applies the "
-                      "diagnostic pixel-weight threshold to both the position and its reference. "
-                      "Pixel weights describe geometric support, not photon counts. Such spikes alone do not "
-                      "establish a correction defect. Both panels use the final applied gains.")
+            paragraph(
+                "**Low-support spikes:** individual-position curves can spike "
+                "where very few pixels contribute, especially near coverage edges. "
+                "Panel A includes all supported bins; panel B applies the "
+                "diagnostic pixel-weight threshold to both the position and its "
+                "reference. Pixel weights describe geometric support, not photon "
+                "counts. Such spikes alone do not establish a correction defect. "
+                "Both panels use the final applied gains."
+            )
     if not diagnostic.get("figures"):
         paragraph("No completed diagnostic gallery recorded yet.")
     if diagnostic.get("skips"):
-        table(["Skipped diagnostic", "Reason"], [(item.get("plot"), item.get("reason")) for item in diagnostic["skips"]])
+        table(
+            ["Skipped diagnostic", "Reason"],
+            [(item.get("plot"), item.get("reason")) for item in diagnostic["skips"]],
+        )
 
     section("Processing settings")
-    table(["Option", "Value"], [(key.replace("_", " "), value) for key, value in args.items()])
+    table(
+        ["Option", "Value"],
+        [(key.replace("_", " "), value) for key, value in args.items()],
+    )
     software = record.get("software", {})
     if software:
         section("Software and reproducibility")
         paragraph(f"**Python:** {_text(software.get('python'))}")
         paragraph(f"**Platform:** {_text(software.get('platform'))}")
         table(["Package", "Version"], software.get("packages", {}).items())
-    paragraph("The JSON companion retains full fit history, per-position values, graph edges, residual summaries and provenance hashes without crowding this overview.")
+    paragraph(
+        "The JSON companion retains full fit history, per-position values, "
+        "graph edges, residual summaries and provenance hashes without "
+        "crowding this overview."
+    )
     return "\n".join(lines)
 
 
-def write_markdown_report(path, record):
+def write_markdown_report(path: str | Path, record: Mapping[str, Any]) -> None:
     """Atomically replace only the human-readable companion report."""
     path = Path(path)
     temporary = path.with_suffix(path.suffix + ".tmp")
