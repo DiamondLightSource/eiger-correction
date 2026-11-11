@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 import h5py
 import numpy as np
 
+import eiger_correction.__main__ as cli_main
 import eiger_correction.eiger_diagnostics as diagnostics
 import eiger_correction.eiger_workflow as workflow
 import eiger_correction.extract_eiger_corrections as cli
@@ -212,8 +213,8 @@ class LifecycleTests(TemporaryCase):
                     if emit_warning:
                         warnings.warn("synthetic warning", RuntimeWarning, stacklevel=2)
 
-            with patch.object(cli, "extract", side_effect=extraction):
-                self.assertEqual(cli.main(self.argv(directory)), 0)
+            with patch.object(cli_main, "extract", side_effect=extraction):
+                self.assertEqual(cli_main.main(self.argv(directory)), 0)
             self.assert_restored(stdout, stderr, handlers, warning_hook)
             report = strict_json(directory / "report.json")
             self.assertEqual(
@@ -267,8 +268,8 @@ class LifecycleTests(TemporaryCase):
                         )
                         raise error
 
-            with patch.object(cli, "extract", side_effect=extraction):
-                self.assertEqual(cli.main(self.argv(directory)), 1)
+            with patch.object(cli_main, "extract", side_effect=extraction):
+                self.assertEqual(cli_main.main(self.argv(directory)), 1)
             self.assert_restored(stdout, stderr, handlers, warning_hook)
             report = strict_json(directory / "report.json")
             self.assertEqual(report["status"], status)
@@ -293,17 +294,17 @@ class LifecycleTests(TemporaryCase):
         sentinel = directory / "run.log"
         sentinel.write_bytes(b"original contents\n")
         with (
-            patch.object(cli, "extract") as extract,
+            patch.object(cli_main, "extract") as extract,
             self.assertRaises(FileExistsError),
         ):
-            cli.main(self.argv(directory))
+            cli_main.main(self.argv(directory))
         extract.assert_not_called()
         self.assertEqual(sentinel.read_bytes(), b"original contents\n")
         self.assertEqual(list(directory.iterdir()), [sentinel])
 
     def test_invalid_arguments_are_reported_inside_inputs_stage(self):
         directory = self.root / "invalid"
-        self.assertEqual(cli.main(self.argv(directory, "--theta-bins", "0")), 1)
+        self.assertEqual(cli_main.main(self.argv(directory, "--theta-bins", "0")), 1)
         report = strict_json(directory / "report.json")
         self.assertEqual(report["status"], "failed")
         self.assertEqual(report["error"]["type"], "ValueError")
@@ -770,7 +771,7 @@ class SyntheticExtractionTests(TemporaryCase):
         directory = self.root / "extracted"
         with ExitStack() as stack:
             unity, fit = self.synthetic_workflow(stack)
-            code = cli.main(
+            code = cli_main.main(
                 self.argv(
                     directory,
                     "--validation",
@@ -835,7 +836,7 @@ class SyntheticExtractionTests(TemporaryCase):
             )
             option = argv.index("--geometry")
             del argv[option : option + 2]
-            code = cli.main(argv)
+            code = cli_main.main(argv)
             factory = cast(MagicMock, workflow.PhysicalModel)
             self.assertEqual(factory.call_args.args[0], config)
         self.assert_exports(directory, code, unity, fit)
@@ -868,7 +869,7 @@ class SyntheticExtractionTests(TemporaryCase):
             writer = stack.enter_context(
                 patch.object(workflow, "save_processed", side_effect=save_theta)
             )
-            code = cli.main(
+            code = cli_main.main(
                 self.argv(
                     directory,
                     "--validation",
@@ -933,7 +934,9 @@ class SyntheticExtractionTests(TemporaryCase):
                     side_effect=RuntimeError("synthetic fit failure"),
                 )
             )
-            self.assertEqual(cli.main(self.argv(directory, "--validation", "basic")), 1)
+            self.assertEqual(
+                cli_main.main(self.argv(directory, "--validation", "basic")), 1
+            )
         report = strict_json(directory / "report.json")
         self.assertEqual(report["stages"]["detector_fit"]["status"], "failed")
         self.assertEqual(report["stages"]["aggregation"]["status"], "passed")
