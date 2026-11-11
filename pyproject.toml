@@ -17,7 +17,7 @@ dependencies = [
   "scipy",
   "h5py",
   "matplotlib",
-  "pyfai">=2024.9",
+  "pyfai>=2024.9",
   "xraylib",
   "hdf5plugin"] # Add project dependencies here, e.g. ["click", "numpy"]
 
@@ -48,12 +48,12 @@ email = "richard.dixey@diamond.ac.uk"
 name = "Richard Dixey"
 
 [[project.authors]]
-mail = "dean.keeble@diamond.ac.uk"
+email = "dean.keeble@diamond.ac.uk"
 name = "Dean Keeble"
 
 [tool.uv]
 # Minimum uv to fix eMudhra CA cert incident (see discuss.python.org/t/109576)
-required-version = ">=0.13.5"
+required-version = ">=0.12.5"
 
 [tool.setuptools_scm]
 version_file = "src/eiger_correction/_version.py"
