@@ -9,6 +9,32 @@ JPEG generation in [eiger_diagnostics.py](src/eiger_correction/eiger_diagnostics
 and the Markdown report in [eiger_report.py](src/eiger_correction/eiger_report.py).
 No Jupyter installation is needed.
 
+## Quick start
+
+```bash
+eiger-correction /dls/i15-1/data/2026/cm44163-4/i15-1-100605.nxs --output-dir /some/output/directory
+```
+
+This writes the following to the output directory:
+
+```text
+detector_corrections.h5   # detector calibration
+pattern.h5                # final integrated pattern
+pattern_2theta.xy         # two-column 2theta / intensity
+angle_grouping.jpg
+azimuth_geometry.jpg
+detector_response.jpg
+final_xy.jpg
+overlap_final_abcd.jpg
+position_gains.jpg
+sampling_q.jpg
+report.json               # machine-readable run record
+report.md                 # human-readable report with embedded JPEGs
+run.log                   # full process log
+```
+
+See [Outputs and unattended operation](#outputs-and-unattended-operation) for details.
+
 ## Environment and invocation
 
 Python 3.11 or newer is required. Install the package and its dependencies with
