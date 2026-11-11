@@ -1,0 +1,58 @@
+{
+  "content": "Goniometer calibration v2",
+  "detector": "Eiger2 CdTe 500k",
+  "detector_config": {
+    "pixel1": 7.5e-05,
+    "pixel2": 7.5e-05,
+    "orientation": 3
+  },
+  "wavelength": 1.616693159906119e-11,
+  "param": [
+    0.2519145290151987,
+    0.02138205163252793,
+    0.03894021073661042,
+    0.024929527924284354,
+    -0.007922701557459014,
+    -0.0011016064522187316,
+    0.0016735672895077328,
+    -0.0009794311198276604
+  ],
+  "param_names": [
+    "dist",
+    "poni1",
+    "poni2",
+    "rot1_offset",
+    "rot2",
+    "rot3",
+    "sample_x",
+    "sample_z"
+  ],
+  "pos_names": [
+    "two_theta"
+  ],
+  "trans_function": {
+    "content": "GeometryTransformation",
+    "param_names": [
+      "dist",
+      "poni1",
+      "poni2",
+      "rot1_offset",
+      "rot2",
+      "rot3",
+      "sample_x",
+      "sample_z"
+    ],
+    "pos_names": [
+      "two_theta"
+    ],
+    "dist_expr": "dist - ((cos((rot1_offset - (two_theta * 0.017453292519943295))) * (-sin(rot3) * sin(rot2)) + sin((rot1_offset - (two_theta * 0.017453292519943295))) * cos(rot2)) * sample_x + (-sin((rot1_offset - (two_theta * 0.017453292519943295))) * (-sin(rot3) * sin(rot2)) + cos((rot1_offset - (two_theta * 0.017453292519943295))) * cos(rot2)) * sample_z)",
+    "poni1_expr": "poni1 + ((cos((rot1_offset - (two_theta * 0.017453292519943295))) * (sin(rot3) * cos(rot2)) + sin((rot1_offset - (two_theta * 0.017453292519943295))) * sin(rot2)) * sample_x + (-sin((rot1_offset - (two_theta * 0.017453292519943295))) * (sin(rot3) * cos(rot2)) + cos((rot1_offset - (two_theta * 0.017453292519943295))) * sin(rot2)) * sample_z)",
+    "poni2_expr": "poni2 + ((cos((rot1_offset - (two_theta * 0.017453292519943295))) * cos(rot3)) * sample_x + (-sin((rot1_offset - (two_theta * 0.017453292519943295))) * cos(rot3)) * sample_z)",
+    "rot1_expr": "arctan2(-(-sin((rot1_offset - (two_theta * 0.017453292519943295))) * cos(rot3)), (-sin((rot1_offset - (two_theta * 0.017453292519943295))) * (-sin(rot3) * sin(rot2)) + cos((rot1_offset - (two_theta * 0.017453292519943295))) * cos(rot2)))",
+    "rot2_expr": "arcsin((-sin((rot1_offset - (two_theta * 0.017453292519943295))) * (sin(rot3) * cos(rot2)) + cos((rot1_offset - (two_theta * 0.017453292519943295))) * sin(rot2)))",
+    "rot3_expr": "arctan2((cos((rot1_offset - (two_theta * 0.017453292519943295))) * (sin(rot3) * cos(rot2)) + sin((rot1_offset - (two_theta * 0.017453292519943295))) * sin(rot2)), (cos(rot3) * cos(rot2))) + 1.5707963267948966",
+    "constants": {
+      "pi": 3.141592653589793
+    }
+  }
+}

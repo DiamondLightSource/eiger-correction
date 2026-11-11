@@ -1,0 +1,10 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: eiger-correction
+  title: eiger-correction
+  description: A python library used to correct polarisation artefacts in the Eiger CdTe 500x detector
+spec:
+  type: library
+  lifecycle: production
+  owner: group:default/data-analysis

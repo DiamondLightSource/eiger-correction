@@ -1,0 +1,20 @@
+# Changes here will be overwritten by Copier
+_commit: 5.5.0
+_src_path: https://github.com/DiamondLightSource/python-copier-template.git
+author_email: richard.dixey@diamond.ac.uk
+author_name: Richard Dixey
+component_lifecycle: production
+component_owner: group:default/data-analysis
+component_type: library
+description: A python library used to correct polarisation artefacts in the Eiger
+    CdTe 500x detector
+distribution_name: eiger-correction
+docker: true
+docs_type: README
+git_platform: github.com
+github_org: DiamondLightSource
+package_name: eiger_correction
+pypi: false
+repo_name: eiger-correction
+strict_typing: false
+type_checker: pyright
