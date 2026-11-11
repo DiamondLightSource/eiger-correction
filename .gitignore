@@ -5,6 +5,16 @@ __pycache__/
 # C extensions
 *.so
 
+.ipynb_checkpoints/
+
+# Raw detector and scan inputs are supplied locally, not committed.
+*.h5
+*.nxs
+
+# Default run directories (created as outputs/ in the working directory).
+outputs/
+
+*ten_corrections/*
 
 #mac files
 .DS_Store
