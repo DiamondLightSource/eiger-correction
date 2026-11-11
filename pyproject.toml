@@ -7,19 +7,22 @@ name = "eiger-correction"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
 ]
 description = "A python library used to correct polarisation artefacts in the Eiger CdTe 500x detector"
 dependencies = [
-  "numpy>2",
-  "scipy",
-  "h5py",
-  "matplotlib",
-  "pyfai>=2024.9",
-  "xraylib",
-  "hdf5plugin"] # Add project dependencies here, e.g. ["click", "numpy"]
+    "numpy>2",
+    "scipy",
+    "h5py",
+    "matplotlib",
+    "pyfai>=2024.9",
+    "xraylib",
+    "hdf5plugin",
+    "papermill",
+] # Add project dependencies here, e.g. ["click", "numpy"]
 
 dynamic = ["version"]
 license.file = "LICENSE"
@@ -60,7 +63,7 @@ version_file = "src/eiger_correction/_version.py"
 
 [tool.pyright]
 typeCheckingMode = "standard"
-reportMissingImports = false # Ignore missing stubs in imported modules
+reportMissingImports = false  # Ignore missing stubs in imported modules
 
 [tool.pytest.ini_options]
 # Run pytest with all our checkers, and don't spam us with massive tracebacks on error
