@@ -46,6 +46,22 @@ run.log                   # full process log
 
 See [Outputs and unattended operation](#outputs-and-unattended-operation) for details.
 
+## Interactive notebook
+
+[notebooks/extract_eiger_corrections.ipynb](notebooks/extract_eiger_corrections.ipynb)
+runs the same two-stage extraction step by step with the package functions, showing
+every intermediate printout and plot inline. Settings live in the cell tagged
+`parameters`, so it can also be run headless with papermill:
+
+```bash
+papermill notebooks/extract_eiger_corrections.ipynb run.ipynb \
+    -p SCAN_PATH /dls/i15-1/data/2026/cm44163-4/i15-1-100605.nxs \
+    -p OUTPUT_DIRECTORY /some/output/directory
+```
+
+It writes the calibration HDF5 and 2theta XY to `OUTPUT_DIRECTORY` (default
+`./outputs`), and `run.ipynb` keeps all the figures.
+
 ## Environment and invocation
 
 Python 3.11 or newer is required. Install the package and its dependencies with

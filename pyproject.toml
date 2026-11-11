@@ -22,6 +22,7 @@ dependencies = [
     "xraylib",
     "hdf5plugin",
     "papermill",
+    "ipykernel>=7.4.0",
 ] # Add project dependencies here, e.g. ["click", "numpy"]
 
 dynamic = ["version"]
