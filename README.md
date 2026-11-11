@@ -1,16 +1,20 @@
 # EIGER scan extraction
 
-This `scan-processing` branch contains the headless processing workflow, not the
-investigational notebooks. Those remain in the history of `main`. The entry point
-is [extract_eiger_corrections.py](extract_eiger_corrections.py), with scientific
-routines in [eiger_workflow.py](eiger_workflow.py) and JPEG generation in
-[eiger_diagnostics.py](eiger_diagnostics.py). No Jupyter installation is needed.
+A headless workflow that corrects polarisation and detector-response artefacts in
+EIGER2 CdTe 500K scans. The `eiger-correction` command is defined in
+[\_\_main\_\_.py](src/eiger_correction/__main__.py). The extraction stages are in
+[extract_eiger_corrections.py](src/eiger_correction/extract_eiger_corrections.py),
+scientific routines in [eiger_workflow.py](src/eiger_correction/eiger_workflow.py),
+JPEG generation in [eiger_diagnostics.py](src/eiger_correction/eiger_diagnostics.py)
+and the Markdown report in [eiger_report.py](src/eiger_correction/eiger_report.py).
+No Jupyter installation is needed.
 
 ## Environment and invocation
 
-Create/activate the Conda environment described in [environment.yml](environment.yml)
-using your usual Conda or micromamba installation. From the repository directory,
-invoke `python extract_eiger_corrections.py SCAN` with the source NeXus path.
+Python 3.11 or newer is required. Install the package and its dependencies with
+`uv sync` (or `pip install .`). The dev container does this automatically. Then run
+`eiger-correction SCAN` (or `python -m eiger_correction SCAN`) with the source
+NeXus path.
 By default, the goniometer calibration is decoded directly from the JSON blob at
 `/entry/plan_metadata/geometry_calibration` in that scan. An explicit
 `--geometry GEOMETRY_JSON` **overrides** the embedded geometry; an unreadable or
@@ -18,16 +22,19 @@ invalid override is an error, never a silent fallback. Missing/invalid embedded
 JSON requires an explicit file. Geometry compatibility checks still apply.
 The selected source and checksum are recorded in the JSON report and the source
 is shown in the Markdown overview; exported HDF5 retains the selected geometry.
-`--help` describes every option.
+`--help` describes every option and `--version` prints the installed version.
 `--output-dir DIRECTORY` chooses a **new** run directory; otherwise a unique UTC
 timestamped directory is created under outputs. Existing directories are rejected,
 even if empty: outputs are never overwritten and simultaneous jobs cannot collide.
 
 For example, the real-data smoke test used scan 100605 from visit cm44163-4,
-the bundled October 15 geometry, and `--raw-audit`. All source inputs are opened
-read-only. Companion detector, I0, and metadata filenames are inferred from the
-NeXus stem; `--detector`, `--monitor`, and `--metadata` override them. See
-[data/README.md](data/README.md) for input requirements.
+the bundled October 15 geometry
+([src/eiger_correction/data/](src/eiger_correction/data/)), and `--raw-audit`.
+All source inputs are opened read-only. Companion detector (`STEM-fastcs_eiger_000001.h5`),
+I0 (`STEM-i0.h5`) and metadata (`STEM-fastcs_eiger_meta.h5`) filenames are
+inferred from the NeXus stem; `--detector`, `--monitor` and `--metadata` override
+them. If the detector file is absent, frames are read from
+`entry/fastcs_eiger/data` in the NeXus file itself.
 
 ### Defaults matching the latest extraction notebook
 
@@ -42,7 +49,10 @@ NeXus stem; `--detector`, `--monitor`, and `--metadata` override them. See
 | Overlap support | 100 pixel weight, 20 shared bins | `--overlap-min-pixels`, `--overlap-min-bins` |
 | Overlap fractional floor | 0.003 | `--overlap-floor` |
 | Diagnostic scattering interval | 30–80° | `--diagnostic-range LOW HIGH` |
-| Independent validation | One held-out detector fold | `--validation holdout` |
+| Independent validation | One held-out detector fold | `--validation basic\|holdout\|full` |
+| Polarization factor | 0.95 | `--polarization` |
+| CdTe density | 6.2 g/cm³ | `--density` |
+| JPEG resolution | 140 dpi | `--jpeg-dpi` |
 
 `--theta-max 0` selects the maximum finite unmasked pyFAI pixel-centre angle
 across the scan, including the per-position azimuth selection. Narrower ranges or
@@ -52,8 +62,6 @@ such as 170, −170 are supported. The opposite wedge is not implicitly included
 
 ## Outputs and unattended operation
 
-Every run directory contains:
-
 Both HDF5 exports include NeXus `NXentry`/`NXdata`, root/entry `default`,
 `signal` and `axes` tags for automatic plotting in readers such as DAWN.
 The pattern defaults to intensity versus 2theta (degrees), with conditional
@@ -62,14 +70,16 @@ the combined pixel × sensor divisor image, with detector column/row pixel-index
 coordinates. Legacy dataset-level plot tags are included for older readers.
 Existing dataset paths remain valid; additional hard links do not copy arrays.
 
-- **Calibration HDF5:** detector/pixel/sensor divisors, fixed masks, geometry,
+Every run directory contains:
+
+- **Calibration HDF5** (`detector_corrections.h5`): detector/pixel/sensor divisors, fixed masks, geometry,
 	physical model, fit history and settings, held-out results, final source-only
 	position gains, and separately labelled stage-1 nuisance gains.
-- **Pattern HDF5:** final 2theta axis, intensity, conditional Poisson sigma,
+- **Pattern HDF5** (`pattern.h5`): final 2theta axis, intensity, conditional Poisson sigma,
 	signal/normalization/variance/pixel-weight accumulators per position and merged,
 	fit-range flags, angles, I0, gains and applied corrections. There is deliberately
 	no redundant Q integration.
-- **Two-column XY:** 2theta degrees and intensity, ten significant digits;
+- **Two-column XY** (`pattern_2theta.xy`): 2theta degrees and intensity, ten significant digits;
 	unsupported bins are omitted, not filled or interpolated.
 - **Seven JPEGs:** actual angle grouping; geometry-only azimuth masks; response
 	maps/sensor gains/monitors; Q sampling; stage-1/final gains; full/zoom intensity;
@@ -79,18 +89,18 @@ Existing dataset paths remain valid; additional hard links do not copy arrays.
 	The overlap figure notes that individual curves may spike where few pixels
 	contribute; A retains all supported bins, while B uses the diagnostic
 	pixel-weight threshold. The historical JPEG filename is retained for existing links.
-- **JSON run report:** status, inputs, software versions and source/geometry
+- **JSON run report** (`report.json`): status, inputs, software versions and source/geometry
 	hashes, settings, per-stage timing, validation metrics, fit history, all gains,
 	graph edges/support, residual summaries, output names, warnings and exceptions.
 	It is atomically checkpointed before/after each stage, not only on success.
-	- **Markdown run report:** a human-readable companion to the same JSON snapshot,
-	  including a run overview, warnings/failures, validation and timing tables,
-	  processing settings, product links and an embedded, labelled JPEG gallery.
-	  Open the Markdown preview in VS Code to see the images; the relative links
-	  remain valid when the complete run directory is moved. Both reports are
-	  updated at every checkpoint, including failed and interrupted runs. Detailed
-	  arrays and graph edges remain in JSON rather than overwhelming the overview.
-- **Text run log:** Python stdout/stderr, fit progress, logging and failure
+- **Markdown run report** (`report.md`): a human-readable companion to the same
+	JSON snapshot, including a run overview, warnings/failures, validation and timing
+	tables, processing settings, product links and an embedded, labelled JPEG gallery.
+	Open the Markdown preview in VS Code to see the images; the relative links
+	remain valid when the complete run directory is moved. Both reports are
+	updated at every checkpoint, including failed and interrupted runs. Detailed
+	arrays and graph edges remain in JSON rather than overwhelming the overview.
+- **Text run log** (`run.log`): Python stdout/stderr, fit progress, logging and failure
 	tracebacks. Python warnings also appear in the report. No successful processing
 	step depends on reading terminal stdout.
 
@@ -177,10 +187,10 @@ Response use outside the fit-Q interval is extrapolation. Poisson sigma omits ga
 calibration, monitor and physical-model uncertainty and neighboring-bin covariance.
 Treat the method as exploratory until independently validated.
 
-Run the local synthetic/core suite with `python -m unittest discover`. It does not
-require beamline data. The real scan-100605 smoke test (2026-11-10; Python 3.14.6,
+Run the synthetic test suite with `pytest`; it does not require beamline data.
+`tox -p` runs the tests together with pre-commit (ruff lint/format) and pyright. The real scan-100605 smoke test (2026-11-10; Python 3.14.6,
 pyFAI 2026.5.0) completed in 89.6 s with held-out validation and raw audit: 3608 raw
-frames → 41 groups, 334 graph edges, all 2001 bins supported, all nine JPEGs, no
+frames → 41 groups, 334 graph edges, all 2001 bins supported, all JPEGs, no
 reported warnings. Absolute held-out overlap changed from 1.054% to 0.247%.
 These are a single-run observation, not a speed guarantee or scientific certification.
 
