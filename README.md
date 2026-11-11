@@ -1,4 +1,15 @@
-# EIGER scan extraction
+[![CI](https://github.com/DiamondLightSource/eiger-correction/actions/workflows/ci.yml/badge.svg)](https://github.com/DiamondLightSource/eiger-correction/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/DiamondLightSource/eiger-correction/branch/main/graph/badge.svg)](https://codecov.io/gh/DiamondLightSource/eiger-correction)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+
+# eiger-correction
+
+What            | Where
+:---:           | :---:
+Source          | <https://github.com/DiamondLightSource/eiger-correction>
+Install         | `pip install git+https://github.com/DiamondLightSource/eiger-correction.git`
+Docker          | `docker run ghcr.io/diamondlightsource/eiger-correction:latest`
+Releases        | <https://github.com/DiamondLightSource/eiger-correction/releases>
 
 A headless workflow that corrects polarisation and detector-response artefacts in
 EIGER2 CdTe 500K scans. The `eiger-correction` command is defined in
