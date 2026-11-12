@@ -94,7 +94,7 @@ them. If the detector file is absent, frames are read from
 | Setting | Default | CLI control |
 |---|---|---|
 | Azimuth | Single inclusive pyFAI chi wedge 67.5–112.5° | `--azimuth-range LOW HIGH`; `--all-azimuths` disables |
-| Detector-fit Q interval | 100–400 nm⁻¹ | `--fit-q-range LOW HIGH` |
+| Detector-fit Q interval | 10–40 Å⁻¹ | `--fit-q-range LOW HIGH` |
 | Fit bins / iterations | 1200 / 10 | `--fit-bins`, `--iterations` |
 | Final 2theta grid | 2001 bins, 0–80° | `--theta-bins`, `--theta-max` |
 | Angle grouping tolerance | 0.001° | `--angle-tolerance`; zero means exact repeats |

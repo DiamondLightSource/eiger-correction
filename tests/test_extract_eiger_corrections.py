@@ -120,6 +120,7 @@ class ArgumentTests(TemporaryCase):
         cli.check_arguments(args)
         self.assertIsInstance(args.scan, Path)
         self.assertEqual(args.validation, "holdout")
+        self.assertEqual(args.fit_q_range, (10.0, 40.0))
         for values in (
             {"theta_max": 0.0, "angle_tolerance": 0.0, "polarization": -1.0},
             {"theta_max": 180.0, "polarization": 1.0, "fit_bins": 65535},
@@ -782,6 +783,7 @@ class SyntheticExtractionTests(TemporaryCase):
                     "8",
                 )
             )
+            self.assertEqual(workflow.build_cache.call_args.args[3], (100.0, 400.0))
         self.assert_exports(directory, code, unity, fit)
         with h5py.File(directory / "pattern.h5", "r") as target:
             entry = h5_group(target, str(target.attrs["default"]))

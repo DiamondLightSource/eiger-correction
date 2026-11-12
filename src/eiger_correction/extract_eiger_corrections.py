@@ -142,9 +142,9 @@ def parser() -> argparse.ArgumentParser:
         "--fit-q-range",
         type=float,
         nargs=2,
-        default=(100.0, 400.0),
+        default=(10.0, 40.0),
         metavar=("LOW", "HIGH"),
-        help="nm^-1",
+        help="Detector-fit Q bounds in reciprocal angstroms (A^-1)",
     )
     result.add_argument("--fit-bins", type=int, default=1200)
     result.add_argument("--iterations", type=int, default=10)
@@ -450,6 +450,9 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
 
     with record.stage("inputs"):
         check_arguments(args)
+        # Scientific fitting and saved calibration settings retain nm^-1.
+        # Convert once at the CLI boundary, without mutating recorded arguments.
+        fit_q_range = tuple(float(value * 10) for value in args.fit_q_range)
         geometry, geometry_provenance = load_geometry(args.scan, args.geometry)
         record.data["inputs"] = {"scan": args.scan.resolve(), **geometry_provenance}
         raw = workflow.load_scan(args.scan, args.detector, args.monitor, args.metadata)
@@ -549,7 +552,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
             sensors[base_mask] = -1
             vertical = model.vertical_check()
             workflow.constant_pattern_check(
-                model, base_mask, args.fit_q_range, args.fit_bins
+                model, base_mask, fit_q_range, args.fit_bins
             )
             record.data["geometry_checks"] = {
                 "vertical": vertical,
@@ -568,7 +571,8 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
         }
         settings = {
             **options,
-            "q_range": args.fit_q_range,
+            "q_range": fit_q_range,
+            "q_range_unit": "nm^-1",
             "azimuth_range_deg": azimuth,
             "angle_aggregation": {
                 "enabled": True,
@@ -584,7 +588,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 scan,
                 model,
                 base_mask,
-                args.fit_q_range,
+                fit_q_range,
                 args.fit_bins,
                 saturation=np.inf,
             )
@@ -622,7 +626,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                         held_fit,
                         test,
                         base_mask,
-                        args.fit_q_range,
+                        fit_q_range,
                         args.fit_bins,
                         saturation=np.inf,
                         validate_frame_gains=args.validation == "full",
@@ -674,7 +678,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
             fit = workflow.fit_response(
                 cache, indices, sensors, len(scan.angles), **options
             )
-            fit["q_range"] = args.fit_q_range
+            fit["q_range"] = fit_q_range
             record.data["detector_fit"] = {
                 "sensor_gains": fit["sensor_gains"],
                 "bad_pixels": int(fit["bad_pixel_mask"].sum()),
