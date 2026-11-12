@@ -60,8 +60,11 @@ papermill notebooks/extract_eiger_corrections.ipynb run.ipynb \
     -p OUTPUT_DIRECTORY /some/output/directory
 ```
 
-It writes the calibration HDF5 and 2theta XY to `OUTPUT_DIRECTORY` (default
-`./outputs`), and `run.ipynb` keeps all the figures.
+It writes calibration and dual-grid pattern HDF5 files with `WRITE_CALIBRATION=True`
+and separate `_tth.xy` / `_q.xy` files with `WRITE_XY=True`, to `OUTPUT_DIRECTORY`
+(default `./outputs`). `run.ipynb` keeps all the figures. Notebook parameters
+`FIT_Q_RANGE`, `Q_STEP_SIZE`, `TWO_THETA_STEP_SIZE` and `Q_MAX` use the same units
+and final-only cutoff semantics as the CLI. Overlap diagnostics remain full-range.
 
 ## Environment and invocation
 
@@ -124,7 +127,8 @@ threshold relaxation or fallback. Chi bounds are inclusive; seam-crossing bounds
 such as 170, −170 are supported. The opposite wedge is not implicitly included.
 
 Bin counts are derived as `ceil((upper - lower) / step)`, retaining exact range
-endpoints. Actual uniform bin widths are therefore at most the requested step.
+endpoints. Uniform bin widths are therefore at most the requested step, apart
+from pyFAI's small floating-point expansion of integration limits.
 The fit grid must contain 16–65535 bins. The former `--fit-bins` and
 `--theta-bins` options are replaced by the step-size options; `--theta-max`
 is replaced by `--q-max`.
@@ -265,6 +269,13 @@ pyFAI 2026.5.0) completed in 89.6 s with held-out validation and raw audit: 3608
 frames → 41 groups, 334 graph edges, all 2001 bins supported, all JPEGs, no
 reported warnings. Absolute held-out overlap changed from 1.054% to 0.247%.
 These are a single-run observation, not a speed guarantee or scientific certification.
+
+The Q-output smoke check (2026-11-12, `pyfai_new`) on the same scan completed
+with `--q-max 20`, default held-out validation and `--raw-audit`: all 41 positions
+remained connected, the raw audit passed, and both XY files matched their HDF5
+grids. A second run without a cutoff read NeXus `q_max=25` Å⁻¹. Detector divisors,
+bad-pixel masks and final position gains were bit-identical between the two runs.
+The processing range stayed 0–87.133° while the 20 Å⁻¹ output stopped at 29.820°.
 
 Raw data and generated products are not versioned. Share them separately subject
 to institutional policy; do not commit generated detector data or results.

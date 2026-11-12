@@ -631,6 +631,46 @@ class ThetaIntegrationTests(TemporaryCase):
         )
 
 
+class FinalIntegrationTests(TemporaryCase):
+    def test_independent_grids_frozen_gains_and_input_immutability(self):
+        unity = processed_payload()
+        unity["groups"]["merged_q"] = copy.deepcopy(unity["groups"]["merged_2theta"])
+        original_q = unity["groups"]["merged_q"]["axis"].copy()
+        gains = np.exp(np.array([-0.03, -0.01, 0.01, 0.03]))
+        model = stub(geometry=stub(wavelength=1e-10))
+        fit = response_fit()
+        with patch.object(workflow, "process_scan", return_value=unity) as integrate:
+            output = cli.integrate_output(
+                stub(),
+                model,
+                fit,
+                unity["mask"],
+                (0.0, 60.0),
+                0.025,
+                0.025,
+                gains,
+                saturation=1e7,
+            )
+        options = integrate.call_args.kwargs
+        self.assertEqual(options["theta_npt"], 2400)
+        self.assertEqual(options["q_npt"], 252)
+        self.assertEqual(options["saturation"], 1e7)
+        np.testing.assert_allclose(options["q_range"], (0.0, 20 * np.pi))
+        np.testing.assert_array_equal(unity["groups"]["merged_q"]["axis"], original_q)
+        np.testing.assert_allclose(
+            output["groups"]["merged_q"]["axis"], original_q / 10
+        )
+        self.assertEqual(output["groups"]["merged_q"]["unit"], "q_A^-1")
+        for name, group in output["groups"].items():
+            original = unity["groups"][name]["per_frame"]
+            np.testing.assert_array_equal(
+                group["per_frame"][:, (0, 2, 3)], original[:, (0, 2, 3)]
+            )
+            np.testing.assert_allclose(
+                group["per_frame"][:, 1], original[:, 1] * gains[:, None]
+            )
+
+
 class DiagnosticSmokeTests(TemporaryCase):
     def test_all_jpegs_headless_supported_overlap_and_closed_figures(self):
         import matplotlib.pyplot as plt

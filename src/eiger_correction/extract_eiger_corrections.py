@@ -485,6 +485,7 @@ def integrate_output(
     theta_step: float,
     q_step: float,
     gains: NDArray[np.floating[Any]],
+    saturation: float = np.inf,
 ) -> Payload:
     """Integrate final grids with frozen corrections; never refit on cropped data."""
     import eiger_correction.eiger_workflow as workflow
@@ -508,7 +509,7 @@ def integrate_output(
         q_npt=radial_bins((0.0, float(q_max_nm / 10)), q_step),
         theta_npt=radial_bins(theta_range, theta_step),
         theta_range=theta_range,
-        saturation=np.inf,
+        saturation=saturation,
     )
     # Results are redundant once the merge and per-position accumulators exist.
     unity.pop("results", None)
@@ -907,7 +908,9 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 refine_all_position_scales=True,
                 position_scale_refinement={
                     **scale_fit["settings"],
-                    "range": "full unmasked scan 2theta range; independent of output crop",
+                    "range": (
+                        "full unmasked scan 2theta range; independent of output crop"
+                    ),
                     "theta_range_deg": theta_range,
                     "gauge": scale_fit["gauge"],
                     "replaces_stage1_gains": True,
