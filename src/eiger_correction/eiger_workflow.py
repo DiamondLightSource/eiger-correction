@@ -1224,11 +1224,17 @@ def _tag_pattern_plot(file: h5py.File) -> None:
         if name not in entry:
             continue
         group = h5_group(entry, name)
-        axis_name = "q_nm" if name == "merged_q" else "two_theta_deg"
+        q_angstrom = group.attrs.get("unit") == "q_A^-1"
+        axis_name = (
+            ("q_angstrom" if q_angstrom else "q_nm")
+            if name == "merged_q"
+            else "two_theta_deg"
+        )
         _tag_nxdata(group, "intensity", (axis_name,), "spectrum")
-        group[axis_name].attrs["units"] = "nm^-1" if name == "merged_q" else "degrees"
+        q_unit = "angstrom^-1" if q_angstrom else "nm^-1"
+        group[axis_name].attrs["units"] = q_unit if name == "merged_q" else "degrees"
         group[axis_name].attrs["long_name"] = (
-            "Q (nm^-1)" if name == "merged_q" else "Scattering 2theta (degrees)"
+            f"Q ({q_unit})" if name == "merged_q" else "Scattering 2theta (degrees)"
         )
         group["intensity"].attrs["long_name"] = "Normalized intensity (a.u.)"
         group["sigma"].attrs["long_name"] = "Conditional Poisson sigma (a.u.)"
@@ -1585,8 +1591,13 @@ def save_processed(
         entry.attrs["default"] = "merged_2theta"
         for name, payload in processed["groups"].items():
             group = entry.create_group(name)
-            axis_name = "q_nm" if name == "merged_q" else "two_theta_deg"
-            group.attrs["unit"] = "q_nm^-1" if name == "merged_q" else "2th_deg"
+            unit = payload.get("unit", "q_nm^-1" if name == "merged_q" else "2th_deg")
+            axis_name = (
+                ("q_angstrom" if unit == "q_A^-1" else "q_nm")
+                if name == "merged_q"
+                else "two_theta_deg"
+            )
+            group.attrs["unit"] = unit
             group.attrs["n_frames"] = len(scan.angles)
             group.attrs["reference_based_dynamic_rejection"] = False
             for key, values in (

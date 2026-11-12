@@ -142,19 +142,32 @@ def parser() -> argparse.ArgumentParser:
         "--fit-q-range",
         type=float,
         nargs=2,
-        default=(100.0, 400.0),
+        default=(10.0, 40.0),
         metavar=("LOW", "HIGH"),
-        help="nm^-1",
+        help="Detector-fit Q bounds in reciprocal angstroms (A^-1)",
     )
-    result.add_argument("--fit-bins", type=int, default=1200)
-    result.add_argument("--iterations", type=int, default=10)
-    result.add_argument("--theta-bins", type=int, default=2001)
     result.add_argument(
-        "--theta-max",
+        "--q-step-size",
         type=float,
-        default=80.0,
+        default=0.025,
+        help="Target Q bin width in A^-1 for fitting and final extraction",
+    )
+    result.add_argument("--iterations", type=int, default=10)
+    result.add_argument(
+        "--two-theta-step-size",
+        type=float,
+        default=0.025,
+        help="Target 2theta bin width in degrees",
+    )
+    result.add_argument(
+        "--q-max",
+        type=float,
+        default=None,
         help=(
-            "Upper 2theta in degrees; 0 selects automatic unmasked pixel-centre maximum"
+            "Final-output maximum Q in A^-1; default: NeXus "
+            "/entry/plan_metadata/experiment_definition/data/q_max, "
+            "or the unmasked pyFAI maximum if absent/empty. "
+            "Does not limit detector fitting or overlap refinement"
         ),
     )
     result.add_argument("--angle-tolerance", type=float, default=0.001)
@@ -250,25 +263,96 @@ def load_geometry(
     return config, provenance
 
 
+def resolve_q_max(
+    scan_path: str | Path, q_max: float | None = None
+) -> tuple[float | None, str]:
+    """Resolve output Q (A^-1): explicit CLI value, NeXus value, then geometry.
+
+    Absent, null, zero-length and blank-string metadata are empty. Malformed
+    nonempty metadata is an error rather than a silently ignored acquisition limit.
+    An explicit override never reads this optional dataset.
+    """
+    source = "cli"
+    if q_max is None:
+        dataset_path = "/entry/plan_metadata/experiment_definition/data/q_max"
+        with h5py.File(scan_path, "r") as nexus:
+            node = nexus.get(dataset_path)
+            if node is None:
+                return None, "pyfai"
+            if not isinstance(node, h5py.Dataset):
+                raise ValueError(f"Expected a scalar Q dataset at {dataset_path}")
+            if node.shape is None:
+                return None, "pyfai"
+            value = np.asarray(node[()])
+            if value.size == 0:
+                return None, "pyfai"
+            if value.size != 1:
+                raise ValueError(f"Expected one Q value at {dataset_path}")
+            scalar = value.reshape(-1)[0]
+            if isinstance(scalar, (str, bytes)) and not scalar.strip():
+                return None, "pyfai"
+            try:
+                q_max = float(scalar)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"Invalid Q value at {dataset_path}") from error
+        source = f"nexus:{dataset_path}"
+    if not np.isfinite(q_max) or q_max <= 0:
+        raise ValueError(f"q_max from {source} must be finite and positive (A^-1)")
+    return float(q_max), source
+
+
 def check_arguments(args: argparse.Namespace) -> None:
     for name in ("fit_q_range", "diagnostic_range"):
         low, high = getattr(args, name)
         if not np.all(np.isfinite([low, high])) or not low < high:
             raise ValueError(f"{name} requires finite increasing bounds")
-    if args.fit_q_range[0] <= 0 or not 16 <= args.fit_bins <= 65535:
-        raise ValueError("Positive fit Q bounds and 16..65535 fit bins required")
-    for name in ("iterations", "theta_bins", "overlap_min_bins", "jpeg_dpi"):
+    if args.fit_q_range[0] <= 0:
+        raise ValueError("Positive fit Q bounds required")
+    for name in ("iterations", "overlap_min_bins", "jpeg_dpi"):
         if getattr(args, name) < 1:
             raise ValueError(f"{name} must be positive")
-    for name in ("saturation", "density", "overlap_min_pixels", "overlap_floor"):
+    for name in (
+        "saturation",
+        "density",
+        "overlap_min_pixels",
+        "overlap_floor",
+        "q_step_size",
+        "two_theta_step_size",
+    ):
         if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             raise ValueError(f"{name} must be finite and positive")
     if not np.isfinite(args.angle_tolerance) or args.angle_tolerance < 0:
         raise ValueError("angle_tolerance must be finite and nonnegative")
-    if not np.isfinite(args.theta_max) or not 0 <= args.theta_max <= 180:
-        raise ValueError("theta_max must be 0 (automatic) or in (0, 180]")
+    if args.q_max is not None and (not np.isfinite(args.q_max) or args.q_max <= 0):
+        raise ValueError("q_max must be None or finite and positive (A^-1)")
     if not np.isfinite(args.polarization) or not -1 <= args.polarization <= 1:
         raise ValueError("polarization must be finite and in [-1, 1]")
+    if not 16 <= radial_bins(tuple(args.fit_q_range), args.q_step_size) <= 65535:
+        raise ValueError("Fit Q range and q_step_size must produce 16..65535 bins")
+
+
+def radial_bins(limits: tuple[float, float], step: float) -> int:
+    """Cover exact endpoints with uniform bins no wider than the target step."""
+    width = limits[1] - limits[0]
+    if not np.isfinite(width) or width <= 0 or not np.isfinite(step) or step <= 0:
+        raise ValueError("Radial range and step must be finite and positive")
+    count = width / step
+    if not np.isfinite(count) or count > np.iinfo(np.int32).max:
+        raise ValueError("Radial step requests too many bins")
+    # Avoid an extra bin due solely to floating-point division at an integer.
+    return max(1, int(np.ceil(np.nextafter(count, -np.inf))))
+
+
+def output_theta_range(
+    q_max: float | None, wavelength_m: float, full_range: tuple[float, float]
+) -> tuple[float, float]:
+    """Convert the output-only Q limit (A^-1) to 2theta degrees."""
+    if q_max is None:
+        return full_range
+    sine = q_max * (wavelength_m * 1e10) / (4 * np.pi)
+    if not np.isfinite(sine) or not 0 < sine <= 1:
+        raise ValueError("q_max must be positive and no greater than 4*pi/wavelength")
+    return 0.0, float(np.rad2deg(2 * np.arcsin(sine)))
 
 
 def integrate_theta(
@@ -392,6 +476,76 @@ def check_conservation(
     }
 
 
+def integrate_output(
+    scan: Scan,
+    model: PhysicalModel,
+    fit: Mapping[str, Any],
+    base_mask: BoolArray,
+    theta_range: tuple[float, float],
+    theta_step: float,
+    q_step: float,
+    gains: NDArray[np.floating[Any]],
+    saturation: float = np.inf,
+) -> Payload:
+    """Integrate final grids with frozen corrections; never refit on cropped data."""
+    import eiger_correction.eiger_workflow as workflow
+
+    q_max_nm = (
+        4
+        * np.pi
+        * np.sin(np.deg2rad(theta_range[1]) / 2)
+        / (model.geometry.wavelength * 1e9)
+    )
+    unity = workflow.process_scan(
+        scan,
+        {
+            "fit_settings": {"q_range": fit["q_range"]},
+            "base_mask": base_mask,
+            "bad_pixel_mask": fit["bad_pixel_mask"],
+            "combined_divisor": fit["combined_divisor"],
+        },
+        model,
+        q_range=(0.0, float(q_max_nm)),
+        q_npt=radial_bins((0.0, float(q_max_nm / 10)), q_step),
+        theta_npt=radial_bins(theta_range, theta_step),
+        theta_range=theta_range,
+        saturation=saturation,
+    )
+    # Results are redundant once the merge and per-position accumulators exist.
+    unity.pop("results", None)
+    output = workflow.apply_position_scales(unity, gains)
+    output["groups"]["merged_q"]["axis"] = output["groups"]["merged_q"]["axis"] / 10
+    output["groups"]["merged_q"]["unit"] = "q_A^-1"
+    return output
+
+
+def save_xy(directory: Path, processed: Mapping[str, Any]) -> dict[str, str]:
+    """Write supported bins of both independently integrated radial grids."""
+    outputs = {}
+    for name, suffix, label in (
+        ("merged_2theta", "tth", "2theta_deg"),
+        ("merged_q", "q", "q_A^-1"),
+    ):
+        group = processed["groups"][name]
+        supported = (group["accumulators"][1] > 0) & np.isfinite(group["intensity"])
+        if not supported.any():
+            raise ValueError(f"No supported final output bins in {name}")
+        xy = np.column_stack((group["axis"][supported], group["intensity"][supported]))
+        filename = f"pattern_{suffix}.xy"
+        with (directory / filename).open("x", encoding="ascii") as stream:
+            np.savetxt(
+                stream,
+                xy,
+                fmt="%.10g",
+                header=f"{label} intensity; two_stage_overlap; measured I0 retained",
+            )
+        np.testing.assert_allclose(
+            np.loadtxt(directory / filename, ndmin=2), xy, rtol=6e-10, atol=1e-12
+        )
+        outputs[f"xy_{suffix}"] = filename
+    return outputs
+
+
 def raw_audit(
     workflow: ModuleType,
     raw: Scan,
@@ -450,9 +604,16 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
 
     with record.stage("inputs"):
         check_arguments(args)
+        # Scientific fitting and saved calibration settings retain nm^-1.
+        # Convert once at the CLI boundary, without mutating recorded arguments.
+        fit_q_range = (float(args.fit_q_range[0] * 10), float(args.fit_q_range[1] * 10))
+        fit_bins = radial_bins(tuple(args.fit_q_range), args.q_step_size)
         geometry, geometry_provenance = load_geometry(args.scan, args.geometry)
         record.data["inputs"] = {"scan": args.scan.resolve(), **geometry_provenance}
         raw = workflow.load_scan(args.scan, args.detector, args.monitor, args.metadata)
+        q_max, q_max_source = resolve_q_max(args.scan, args.q_max)
+        record.data["output_q_max_angstrom_inverse"] = q_max
+        record.data["output_q_max_source"] = q_max_source
         # Tiny optional metadata read, not another detector-data pass.
         with h5py.File(raw.path, "r") as source:
             current_path = "entry/instrument/synchrotron/current"
@@ -548,16 +709,14 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
             base_mask = scan.native_mask | boundary
             sensors[base_mask] = -1
             vertical = model.vertical_check()
-            workflow.constant_pattern_check(
-                model, base_mask, args.fit_q_range, args.fit_bins
-            )
+            workflow.constant_pattern_check(model, base_mask, fit_q_range, fit_bins)
             record.data["geometry_checks"] = {
                 "vertical": vertical,
                 "constant_pattern": "passed",
                 "fixed_mask_pixels": int(base_mask.sum()),
             }
         options: dict[str, Any] = {
-            "npt": args.fit_bins,
+            "npt": fit_bins,
             "iterations": args.iterations,
             "fit_frame_gains": True,
             "fractional_floor": 0.003,
@@ -568,7 +727,10 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
         }
         settings = {
             **options,
-            "q_range": args.fit_q_range,
+            "q_range": fit_q_range,
+            "q_range_unit": "nm^-1",
+            "q_step_size_angstrom_inverse": args.q_step_size,
+            "two_theta_step_size_deg": args.two_theta_step_size,
             "azimuth_range_deg": azimuth,
             "angle_aggregation": {
                 "enabled": True,
@@ -584,8 +746,8 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 scan,
                 model,
                 base_mask,
-                args.fit_q_range,
-                args.fit_bins,
+                fit_q_range,
+                fit_bins,
                 saturation=np.inf,
             )
             indices = np.array(sorted(cache), dtype=int)
@@ -622,8 +784,8 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                         held_fit,
                         test,
                         base_mask,
-                        args.fit_q_range,
-                        args.fit_bins,
+                        fit_q_range,
+                        fit_bins,
                         saturation=np.inf,
                         validate_frame_gains=args.validation == "full",
                     )
@@ -674,7 +836,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
             fit = workflow.fit_response(
                 cache, indices, sensors, len(scan.angles), **options
             )
-            fit["q_range"] = args.fit_q_range
+            fit["q_range"] = fit_q_range
             record.data["detector_fit"] = {
                 "sensor_gains": fit["sensor_gains"],
                 "bad_pixels": int(fit["bad_pixel_mask"].sum()),
@@ -687,10 +849,10 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 scan,
                 model,
                 base_mask | fit["bad_pixel_mask"],
-                theta_max=args.theta_max or None,
             )
+            theta_bins = radial_bins(theta_range, args.two_theta_step_size)
             unity = integrate_theta(
-                scan, model, fit, base_mask, theta_range, args.theta_bins, sizes
+                scan, model, fit, base_mask, theta_range, theta_bins, sizes
             )
             record.data["theta_range_deg"] = theta_range
         with record.stage("overlap_scales"):
@@ -720,18 +882,35 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                     fit,
                     final,
                     theta_range,
-                    args.theta_bins,
+                    theta_bins,
                     args.saturation,
                 )
         else:
             record.data["raw_audit"] = {"status": "not_requested"}
+        with record.stage("final_integration"):
+            output_range = output_theta_range(
+                q_max, model.geometry.wavelength, theta_range
+            )
+            output = integrate_output(
+                scan,
+                model,
+                fit,
+                base_mask,
+                output_range,
+                args.two_theta_step_size,
+                args.q_step_size,
+                final["frame_gains"],
+            )
+            record.data["output_theta_range_deg"] = output_range
         with record.stage("exports"):
             settings.update(
                 position_scale_model="two_stage_overlap",
                 refine_all_position_scales=True,
                 position_scale_refinement={
                     **scale_fit["settings"],
-                    "range": "full exported 2theta range",
+                    "range": (
+                        "full unmasked scan 2theta range; independent of output crop"
+                    ),
                     "theta_range_deg": theta_range,
                     "gauge": scale_fit["gauge"],
                     "replaces_stage1_gains": True,
@@ -771,34 +950,12 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 calibration["frame_gains"], final["frame_gains"]
             )
             workflow.save_processed(
-                directory / "pattern.h5", scan, calibration, model, final
-            )
-            group = final["groups"]["merged_2theta"]
-            supported = (group["accumulators"][1] > 0) & np.isfinite(group["intensity"])
-            xy = np.column_stack(
-                (group["axis"][supported], group["intensity"][supported])
-            )
-            with (directory / "pattern_2theta.xy").open(
-                "x", encoding="ascii"
-            ) as stream:
-                np.savetxt(
-                    stream,
-                    xy,
-                    fmt="%.10g",
-                    header=(
-                        "2theta_deg intensity; two_stage_overlap; measured I0 retained"
-                    ),
-                )
-            np.testing.assert_allclose(
-                np.loadtxt(directory / "pattern_2theta.xy", ndmin=2),
-                xy,
-                rtol=6e-10,
-                atol=1e-12,
+                directory / "pattern.h5", scan, calibration, model, output
             )
             record.data["outputs"] = {
                 "calibration": calibration_path.name,
                 "pattern": "pattern.h5",
-                "xy": "pattern_2theta.xy",
+                **save_xy(directory, output),
                 "log": "run.log",
             }
         with record.stage("jpeg_diagnostics"):

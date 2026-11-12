@@ -31,7 +31,8 @@ This writes the following to the output directory:
 ```text
 detector_corrections.h5   # detector calibration
 pattern.h5                # final integrated pattern
-pattern_2theta.xy         # two-column 2theta / intensity
+pattern_tth.xy            # two-column 2theta (degrees) / intensity
+pattern_q.xy              # two-column Q (angstrom^-1) / intensity
 angle_grouping.jpg
 azimuth_geometry.jpg
 detector_response.jpg
@@ -59,8 +60,11 @@ papermill notebooks/extract_eiger_corrections.ipynb run.ipynb \
     -p OUTPUT_DIRECTORY /some/output/directory
 ```
 
-It writes the calibration HDF5 and 2theta XY to `OUTPUT_DIRECTORY` (default
-`./outputs`), and `run.ipynb` keeps all the figures.
+It writes calibration and dual-grid pattern HDF5 files with `WRITE_CALIBRATION=True`
+and separate `_tth.xy` / `_q.xy` files with `WRITE_XY=True`, to `OUTPUT_DIRECTORY`
+(default `./outputs`). `run.ipynb` keeps all the figures. Notebook parameters
+`FIT_Q_RANGE`, `Q_STEP_SIZE`, `TWO_THETA_STEP_SIZE` and `Q_MAX` use the same units
+and final-only cutoff semantics as the CLI. Overlap diagnostics remain full-range.
 
 ## Environment and invocation
 
@@ -94,9 +98,11 @@ them. If the detector file is absent, frames are read from
 | Setting | Default | CLI control |
 |---|---|---|
 | Azimuth | Single inclusive pyFAI chi wedge 67.5–112.5° | `--azimuth-range LOW HIGH`; `--all-azimuths` disables |
-| Detector-fit Q interval | 100–400 nm⁻¹ | `--fit-q-range LOW HIGH` |
-| Fit bins / iterations | 1200 / 10 | `--fit-bins`, `--iterations` |
-| Final 2theta grid | 2001 bins, 0–80° | `--theta-bins`, `--theta-max` |
+| Detector-fit Q interval | 10–40 Å⁻¹ | `--fit-q-range LOW HIGH` |
+| Fit and final Q target step | 0.025 Å⁻¹ | `--q-step-size` |
+| Fit iterations | 10 | `--iterations` |
+| Processing and final 2theta target step | 0.025° | `--two-theta-step-size` |
+| Final Q range | 0 to NeXus Q maximum, or unmasked pyFAI maximum | `--q-max` (Å⁻¹) |
 | Angle grouping tolerance | 0.001° | `--angle-tolerance`; zero means exact repeats |
 | Raw saturation threshold | 10⁷ | `--saturation` |
 | Overlap support | 100 pixel weight, 20 shared bins | `--overlap-min-pixels`, `--overlap-min-bins` |
@@ -107,11 +113,25 @@ them. If the detector file is absent, frames are read from
 | CdTe density | 6.2 g/cm³ | `--density` |
 | JPEG resolution | 140 dpi | `--jpeg-dpi` |
 
-`--theta-max 0` selects the maximum finite unmasked pyFAI pixel-centre angle
-across the scan, including the per-position azimuth selection. Narrower ranges or
-wedges can disconnect the overlap graph: this is a hard failure, with no silent
+`--q-max` sets the final maximum Q in Å⁻¹; the corresponding 2theta maximum is
+calculated using the scan wavelength: `2theta = 2 asin(Q * wavelength / (4*pi))`.
+Omitting it (Python `None`) reads `/entry/plan_metadata/experiment_definition/data/q_max`
+in the input NeXus file, also in Å⁻¹. Missing or empty metadata (null dataset,
+empty array or blank string) falls back to the maximum finite unmasked pyFAI
+pixel-centre angle across the scan, including the per-position azimuth selection.
+Nonempty invalid metadata fails clearly; an explicit `--q-max` takes precedence.
+The chosen limit and its source are recorded in the reports. This limit affects
+only the final output integrations, never detector fitting or overlap scales.
+Restrictive azimuth wedges can still disconnect the overlap graph: this is a hard failure, with no silent
 threshold relaxation or fallback. Chi bounds are inclusive; seam-crossing bounds
 such as 170, −170 are supported. The opposite wedge is not implicitly included.
+
+Bin counts are derived as `ceil((upper - lower) / step)`, retaining exact range
+endpoints. Uniform bin widths are therefore at most the requested step, apart
+from pyFAI's small floating-point expansion of integration limits.
+The fit grid must contain 16–65535 bins. The former `--fit-bins` and
+`--theta-bins` options are replaced by the step-size options; `--theta-max`
+is replaced by `--q-max`.
 
 ## Outputs and unattended operation
 
@@ -128,16 +148,18 @@ Every run directory contains:
 - **Calibration HDF5** (`detector_corrections.h5`): detector/pixel/sensor divisors, fixed masks, geometry,
 	physical model, fit history and settings, held-out results, final source-only
 	position gains, and separately labelled stage-1 nuisance gains.
-- **Pattern HDF5** (`pattern.h5`): final 2theta axis, intensity, conditional Poisson sigma,
+- **Pattern HDF5** (`pattern.h5`): independently integrated final 2theta (degrees) and
+	Q (Å⁻¹) grids in `entry/merged_2theta` and `entry/merged_q` (`q_angstrom` axis),
+	intensity, conditional Poisson sigma,
 	signal/normalization/variance/pixel-weight accumulators per position and merged,
-	fit-range flags, angles, I0, gains and applied corrections. There is deliberately
-	no redundant Q integration.
-- **Two-column XY** (`pattern_2theta.xy`): 2theta degrees and intensity, ten significant digits;
+	fit-range flags, angles, I0, gains and applied corrections.
+- **Two-column XY** (`pattern_tth.xy`, `pattern_q.xy`): 2theta degrees or Q (Å⁻¹)
+  and intensity, ten significant digits;
 	unsupported bins are omitted, not filled or interpolated.
 - **Seven JPEGs:** actual angle grouping; geometry-only azimuth masks; response
 	maps/sensor gains/monitors; Q sampling; stage-1/final gains; full/zoom intensity;
-	final overlap panels A–B **after final applied gains**, using the same final
-	integration as the exported pattern. Unsupported intervals are recorded as skips
+	 final overlap panels A–B **after final applied gains**, using the full processing
+	 range, independent of the output crop. Unsupported intervals are recorded as skips
 	and warnings rather than invalidating an otherwise supported extraction.
 	The overlap figure notes that individual curves may spike where few pixels
 	contribute; A retains all supported bins, while B uses the diagnostic
@@ -184,12 +206,13 @@ can contain partial products; only accept a completed report.
 	 overlaps. The graph must connect every position; the equal-position geometric
 	 mean scale is one. Final scales **replace**, not multiply, nuisance scales.
 	 Apply them to normalization accumulators only and rebuild the merge.
-5. Export, read back/check outputs, and render JPEGs from existing results.
+5. Reintegrate the requested final range on independent uniform Q and 2theta grids,
+   apply the frozen gains, export, read back/check outputs, and render full-range JPEGs.
 
 Removed notebook-only work: the low-angle raw-image mask preview, full raw-data
 reread for sampling plots, separate-versus-summed exploratory integrations,
-ungrouped benchmark, duplicate grouping preview algorithm, and duplicate Q
-integration. Residual diagnostics are reused rather than recomputed for the stack.
+ungrouped benchmark and duplicate grouping preview algorithm.
+Residual diagnostics are reused rather than recomputed for the stack.
 One raw source pass is necessary for aggregation; later fitting/validation and
 integration read the much smaller temporary grouped file. `--raw-audit` explicitly
 adds a small independent source reread. No smoothing, tapering, background
@@ -246,6 +269,13 @@ pyFAI 2026.5.0) completed in 89.6 s with held-out validation and raw audit: 3608
 frames → 41 groups, 334 graph edges, all 2001 bins supported, all JPEGs, no
 reported warnings. Absolute held-out overlap changed from 1.054% to 0.247%.
 These are a single-run observation, not a speed guarantee or scientific certification.
+
+The Q-output smoke check (2026-11-12, `pyfai_new`) on the same scan completed
+with `--q-max 20`, default held-out validation and `--raw-audit`: all 41 positions
+remained connected, the raw audit passed, and both XY files matched their HDF5
+grids. A second run without a cutoff read NeXus `q_max=25` Å⁻¹. Detector divisors,
+bad-pixel masks and final position gains were bit-identical between the two runs.
+The processing range stayed 0–87.133° while the 20 Å⁻¹ output stopped at 29.820°.
 
 Raw data and generated products are not versioned. Share them separately subject
 to institutional policy; do not commit generated detector data or results.

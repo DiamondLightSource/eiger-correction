@@ -115,14 +115,27 @@ class TemporaryCase(unittest.TestCase):
 
 
 class ArgumentTests(TemporaryCase):
+    def test_radial_bins_cover_endpoints_at_target_resolution(self):
+        self.assertEqual(cli.radial_bins((10.0, 40.0), 0.025), 1200)
+        self.assertEqual(cli.radial_bins((0.0, 80.0), 0.025), 3200)
+        self.assertEqual(cli.radial_bins((0.0, 1.01), 0.025), 41)
+        self.assertEqual(cli.radial_bins((0.0, 0.001), 0.025), 1)
+        for limits, step in (((1, 0), 1), ((0, 1), 0), ((0, np.inf), 1)):
+            with self.subTest(limits=limits, step=step), self.assertRaises(ValueError):
+                cli.radial_bins(limits, step)
+
     def test_defaults_and_supported_boundary_values(self):
         args = cli.parser().parse_args(self.argv())
         cli.check_arguments(args)
         self.assertIsInstance(args.scan, Path)
         self.assertEqual(args.validation, "holdout")
+        self.assertEqual(args.fit_q_range, (10.0, 40.0))
+        self.assertEqual(args.q_step_size, 0.025)
+        self.assertEqual(args.two_theta_step_size, 0.025)
+        self.assertIsNone(args.q_max)
         for values in (
-            {"theta_max": 0.0, "angle_tolerance": 0.0, "polarization": -1.0},
-            {"theta_max": 180.0, "polarization": 1.0, "fit_bins": 65535},
+            {"q_max": None, "angle_tolerance": 0.0, "polarization": -1.0},
+            {"q_max": 40.0, "polarization": 1.0},
         ):
             with self.subTest(values=values):
                 cli.check_arguments(stub(**{**vars(args), **values}))
@@ -132,7 +145,10 @@ class ArgumentTests(TemporaryCase):
             [],
             ["scan", "--geometry"],
             self.argv(None, "--validation", "unknown"),
-            self.argv(None, "--fit-bins", "abc"),
+            self.argv(None, "--q-step-size", "abc"),
+            self.argv(None, "--fit-bins", "100"),
+            self.argv(None, "--theta-bins", "100"),
+            self.argv(None, "--theta-max", "80"),
             self.argv(None, "--azimuth-range", "20"),
             self.argv(None, "--unknown-option"),
         ]
@@ -155,9 +171,9 @@ class ArgumentTests(TemporaryCase):
         cases = {
             "fit_q_range": [(1, 1), (2, 1), (0, 2), (-1, 2), (1, np.inf), (np.nan, 2)],
             "diagnostic_range": [(2, 1), (1, 1), (1, np.inf), (np.nan, 2)],
-            "fit_bins": [0, 15, 65536],
+            "q_step_size": [0, -1, np.inf, np.nan, 10, 0.00001],
+            "two_theta_step_size": [0, -1, np.inf, np.nan],
             "iterations": [0, -1],
-            "theta_bins": [0],
             "overlap_min_bins": [0],
             "jpeg_dpi": [0],
             "saturation": [0, -1, np.inf, np.nan],
@@ -165,7 +181,7 @@ class ArgumentTests(TemporaryCase):
             "overlap_min_pixels": [0, -1, np.inf, np.nan],
             "overlap_floor": [0, -1, np.inf, np.nan],
             "angle_tolerance": [-1, np.inf, np.nan],
-            "theta_max": [-1, 181, np.inf, np.nan],
+            "q_max": [0, -1, np.inf, np.nan],
             "polarization": [-1.01, 1.01, np.inf, np.nan],
         }
         for field, values in cases.items():
@@ -304,12 +320,52 @@ class LifecycleTests(TemporaryCase):
 
     def test_invalid_arguments_are_reported_inside_inputs_stage(self):
         directory = self.root / "invalid"
-        self.assertEqual(cli_main.main(self.argv(directory, "--theta-bins", "0")), 1)
+        self.assertEqual(
+            cli_main.main(self.argv(directory, "--two-theta-step-size", "0")), 1
+        )
         report = strict_json(directory / "report.json")
         self.assertEqual(report["status"], "failed")
         self.assertEqual(report["error"]["type"], "ValueError")
         self.assertEqual(report["stages"]["inputs"]["status"], "failed")
         self.assertFalse(list(directory.glob(".grouped_*")))
+
+
+class QMaxInputTests(TemporaryCase):
+    dataset = "/entry/plan_metadata/experiment_definition/data/q_max"
+
+    def test_explicit_override_does_not_read_nexus(self):
+        self.assertEqual(
+            cli.resolve_q_max(self.root / "nonexistent.nxs", 20), (20, "cli")
+        )
+
+    def test_missing_and_empty_metadata_use_pyfai_maximum(self):
+        path = self.root / "scan.nxs"
+        for value in (None, h5py.Empty("f"), np.array([]), "", b"  "):
+            with self.subTest(value=value):
+                with h5py.File(path, "w") as source:
+                    if value is not None:
+                        source[self.dataset] = value
+                self.assertEqual(cli.resolve_q_max(path), (None, "pyfai"))
+
+    def test_scalar_singleton_and_string_metadata_in_angstrom_inverse(self):
+        path = self.root / "scan.nxs"
+        for value in (25.0, [25.0], "25.0", b"25.0"):
+            with self.subTest(value=value):
+                with h5py.File(path, "w") as source:
+                    source[self.dataset] = value
+                self.assertEqual(
+                    cli.resolve_q_max(path), (25.0, f"nexus:{self.dataset}")
+                )
+
+    def test_nonempty_invalid_metadata_is_not_silently_ignored(self):
+        path = self.root / "scan.nxs"
+        for value in (0, -1, np.nan, np.inf, "nonsense", [20, 30]):
+            with self.subTest(value=value):
+                with h5py.File(path, "w") as source:
+                    source[self.dataset] = value
+                with self.assertRaises(ValueError):
+                    cli.resolve_q_max(path)
+                self.assertEqual(cli.resolve_q_max(path, 20.0), (20.0, "cli"))
 
 
 class GeometryInputTests(TemporaryCase):
@@ -575,6 +631,46 @@ class ThetaIntegrationTests(TemporaryCase):
         )
 
 
+class FinalIntegrationTests(TemporaryCase):
+    def test_independent_grids_frozen_gains_and_input_immutability(self):
+        unity = processed_payload()
+        unity["groups"]["merged_q"] = copy.deepcopy(unity["groups"]["merged_2theta"])
+        original_q = unity["groups"]["merged_q"]["axis"].copy()
+        gains = np.exp(np.array([-0.03, -0.01, 0.01, 0.03]))
+        model = stub(geometry=stub(wavelength=1e-10))
+        fit = response_fit()
+        with patch.object(workflow, "process_scan", return_value=unity) as integrate:
+            output = cli.integrate_output(
+                stub(),
+                model,
+                fit,
+                unity["mask"],
+                (0.0, 60.0),
+                0.025,
+                0.025,
+                gains,
+                saturation=1e7,
+            )
+        options = integrate.call_args.kwargs
+        self.assertEqual(options["theta_npt"], 2400)
+        self.assertEqual(options["q_npt"], 252)
+        self.assertEqual(options["saturation"], 1e7)
+        np.testing.assert_allclose(options["q_range"], (0.0, 20 * np.pi))
+        np.testing.assert_array_equal(unity["groups"]["merged_q"]["axis"], original_q)
+        np.testing.assert_allclose(
+            output["groups"]["merged_q"]["axis"], original_q / 10
+        )
+        self.assertEqual(output["groups"]["merged_q"]["unit"], "q_A^-1")
+        for name, group in output["groups"].items():
+            original = unity["groups"][name]["per_frame"]
+            np.testing.assert_array_equal(
+                group["per_frame"][:, (0, 2, 3)], original[:, (0, 2, 3)]
+            )
+            np.testing.assert_allclose(
+                group["per_frame"][:, 1], original[:, 1] * gains[:, None]
+            )
+
+
 class DiagnosticSmokeTests(TemporaryCase):
     def test_all_jpegs_headless_supported_overlap_and_closed_figures(self):
         import matplotlib.pyplot as plt
@@ -758,6 +854,9 @@ class SyntheticExtractionTests(TemporaryCase):
         for name, options in mocks.items():
             stack.enter_context(patch.object(workflow, name, **options))
         stack.enter_context(patch.object(cli, "integrate_theta", return_value=unity))
+        output = copy.deepcopy(unity)
+        output["groups"]["merged_q"] = copy.deepcopy(unity["groups"]["merged_2theta"])
+        stack.enter_context(patch.object(workflow, "process_scan", return_value=output))
         stack.enter_context(
             patch.object(
                 diagnostics,
@@ -766,6 +865,59 @@ class SyntheticExtractionTests(TemporaryCase):
             )
         )
         return unity, fit
+
+    def test_output_crop_does_not_change_scale_integration(self):
+        directory = self.root / "cropped"
+        with ExitStack() as stack:
+            unity, _ = self.synthetic_workflow(stack)
+            limits = cast(MagicMock, workflow.theta_range_for_scan)
+            limits.return_value = (0.0, 100.0)
+            q_max = 4 * np.pi * np.sin(np.deg2rad(35) / 2)
+            code = cli_main.main(
+                self.argv(directory, "--validation", "basic", "--q-max", str(q_max))
+            )
+            self.assertEqual(code, 0, (directory / "run.log").read_text())
+            integration = cast(MagicMock, cli.integrate_theta)
+            self.assertEqual(integration.call_args.args[4], (0.0, 100.0))
+            self.assertNotIn("theta_max", limits.call_args_list[0].kwargs)
+            scales = cast(MagicMock, workflow.refine_position_scales)
+            self.assertIs(scales.call_args.args[0], unity["groups"]["merged_2theta"])
+            output = cast(MagicMock, workflow.process_scan)
+            np.testing.assert_allclose(
+                output.call_args.kwargs["theta_range"], (0.0, 35.0)
+            )
+            np.testing.assert_allclose(
+                output.call_args.kwargs["q_range"], (0.0, q_max * 10)
+            )
+
+    def test_nexus_limit_only_controls_final_output(self):
+        directory = self.root / "nexus_crop"
+        with ExitStack() as stack:
+            self.synthetic_workflow(stack)
+            with h5py.File(self.root / "scan.nxs", "r+") as source:
+                source[QMaxInputTests.dataset] = 4.0
+            code = cli_main.main(self.argv(directory, "--validation", "basic"))
+            self.assertEqual(code, 0, (directory / "run.log").read_text())
+            output = cast(MagicMock, workflow.process_scan)
+            np.testing.assert_allclose(output.call_args.kwargs["q_range"], (0.0, 40.0))
+            scales = cast(MagicMock, cli.integrate_theta)
+            self.assertEqual(scales.call_args.args[4], (30.0, 80.0))
+        report = strict_json(directory / "report.json")
+        self.assertEqual(report["output_q_max_angstrom_inverse"], 4.0)
+        self.assertEqual(
+            report["output_q_max_source"], f"nexus:{QMaxInputTests.dataset}"
+        )
+
+    def test_q_limit_conversion_and_physical_bounds(self):
+        full = (0.0, 85.0)
+        self.assertEqual(cli.output_theta_range(None, 1e-10, full), full)
+        np.testing.assert_allclose(
+            cli.output_theta_range(2 * np.pi, 1e-10, full), (0, 60)
+        )
+        self.assertEqual(cli.output_theta_range(4 * np.pi, 1e-10, full), (0, 180))
+        for value in (0, -1, np.inf, np.nan, 4 * np.pi + 0.01):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                cli.output_theta_range(value, 1e-10, full)
 
     def test_end_to_end_synthetic_extraction_real_exports(self):
         directory = self.root / "extracted"
@@ -776,12 +928,14 @@ class SyntheticExtractionTests(TemporaryCase):
                     directory,
                     "--validation",
                     "basic",
-                    "--fit-bins",
-                    "16",
-                    "--theta-bins",
-                    "8",
+                    "--q-step-size",
+                    "1.875",
+                    "--two-theta-step-size",
+                    "6.25",
                 )
             )
+            cache_builder = cast(MagicMock, workflow.build_cache)
+            self.assertEqual(cache_builder.call_args.args[3], (100.0, 400.0))
         self.assert_exports(directory, code, unity, fit)
         with h5py.File(directory / "pattern.h5", "r") as target:
             entry = h5_group(target, str(target.attrs["default"]))
@@ -798,6 +952,20 @@ class SyntheticExtractionTests(TemporaryCase):
             self.assertEqual(group["intensity"].attrs["interpretation"], "spectrum")
             self.assertEqual(group["intensity"].attrs["signal"], 1)
             self.assertEqual(group["intensity_errors"].id, group["sigma"].id)
+            q_group = h5_group(entry, "merged_q")
+            self.assertEqual(q_group.attrs["unit"], "q_A^-1")
+            self.assertEqual(q_group["q_angstrom"].attrs["units"], "angstrom^-1")
+            np.testing.assert_allclose(
+                h5_dataset(q_group, "q_angstrom")[()],
+                unity["groups"]["merged_2theta"]["axis"] / 10,
+            )
+            q_xy = np.loadtxt(directory / "pattern_q.xy")
+            np.testing.assert_allclose(
+                q_xy[:, 0], h5_dataset(q_group, "q_angstrom")[()], rtol=6e-10
+            )
+            np.testing.assert_allclose(
+                q_xy[:, 1], h5_dataset(q_group, "intensity")[()], rtol=6e-10
+            )
         with h5py.File(directory / "detector_corrections.h5", "r") as target:
             entry = h5_group(target, str(target.attrs["default"]))
             self.assertEqual(entry.attrs["NX_class"], "NXentry")
@@ -829,10 +997,10 @@ class SyntheticExtractionTests(TemporaryCase):
                 directory,
                 "--validation",
                 "basic",
-                "--fit-bins",
-                "16",
-                "--theta-bins",
-                "8",
+                "--q-step-size",
+                "1.875",
+                "--two-theta-step-size",
+                "6.25",
             )
             option = argv.index("--geometry")
             del argv[option : option + 2]
@@ -874,10 +1042,10 @@ class SyntheticExtractionTests(TemporaryCase):
                     directory,
                     "--validation",
                     "basic",
-                    "--fit-bins",
-                    "16",
-                    "--theta-bins",
-                    "8",
+                    "--q-step-size",
+                    "1.875",
+                    "--two-theta-step-size",
+                    "6.25",
                 )
             )
         writer.assert_called_once()
@@ -912,7 +1080,7 @@ class SyntheticExtractionTests(TemporaryCase):
                 h5_dataset(group, "frame_accumulators")[()].sum(axis=0),
                 expected["accumulators"],
             )
-        xy = np.loadtxt(directory / "pattern_2theta.xy")
+        xy = np.loadtxt(directory / "pattern_tth.xy")
         np.testing.assert_allclose(xy[:, 0], expected["axis"], rtol=6e-10)
         np.testing.assert_allclose(xy[:, 1], expected["intensity"], rtol=6e-10)
         with h5py.File(directory / "detector_corrections.h5", "r") as target:
@@ -942,7 +1110,7 @@ class SyntheticExtractionTests(TemporaryCase):
         self.assertEqual(report["stages"]["aggregation"]["status"], "passed")
         self.assertEqual(report["error"]["message"], "synthetic fit failure")
         self.assertFalse(list(directory.glob(".grouped_*")))
-        self.assertFalse((directory / "pattern_2theta.xy").exists())
+        self.assertFalse((directory / "pattern_tth.xy").exists())
 
 
 if __name__ == "__main__":
