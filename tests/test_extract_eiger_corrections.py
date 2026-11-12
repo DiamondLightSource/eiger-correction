@@ -115,15 +115,26 @@ class TemporaryCase(unittest.TestCase):
 
 
 class ArgumentTests(TemporaryCase):
+    def test_radial_bins_cover_endpoints_at_target_resolution(self):
+        self.assertEqual(cli.radial_bins((10.0, 40.0), 0.025), 1200)
+        self.assertEqual(cli.radial_bins((0.0, 80.0), 0.025), 3200)
+        self.assertEqual(cli.radial_bins((0.0, 1.01), 0.025), 41)
+        self.assertEqual(cli.radial_bins((0.0, 0.001), 0.025), 1)
+        for limits, step in (((1, 0), 1), ((0, 1), 0), ((0, np.inf), 1)):
+            with self.subTest(limits=limits, step=step), self.assertRaises(ValueError):
+                cli.radial_bins(limits, step)
+
     def test_defaults_and_supported_boundary_values(self):
         args = cli.parser().parse_args(self.argv())
         cli.check_arguments(args)
         self.assertIsInstance(args.scan, Path)
         self.assertEqual(args.validation, "holdout")
         self.assertEqual(args.fit_q_range, (10.0, 40.0))
+        self.assertEqual(args.q_step_size, 0.025)
+        self.assertEqual(args.two_theta_step_size, 0.025)
         for values in (
             {"theta_max": 0.0, "angle_tolerance": 0.0, "polarization": -1.0},
-            {"theta_max": 180.0, "polarization": 1.0, "fit_bins": 65535},
+            {"theta_max": 180.0, "polarization": 1.0},
         ):
             with self.subTest(values=values):
                 cli.check_arguments(stub(**{**vars(args), **values}))
@@ -133,7 +144,9 @@ class ArgumentTests(TemporaryCase):
             [],
             ["scan", "--geometry"],
             self.argv(None, "--validation", "unknown"),
-            self.argv(None, "--fit-bins", "abc"),
+            self.argv(None, "--q-step-size", "abc"),
+            self.argv(None, "--fit-bins", "100"),
+            self.argv(None, "--theta-bins", "100"),
             self.argv(None, "--azimuth-range", "20"),
             self.argv(None, "--unknown-option"),
         ]
@@ -156,9 +169,9 @@ class ArgumentTests(TemporaryCase):
         cases = {
             "fit_q_range": [(1, 1), (2, 1), (0, 2), (-1, 2), (1, np.inf), (np.nan, 2)],
             "diagnostic_range": [(2, 1), (1, 1), (1, np.inf), (np.nan, 2)],
-            "fit_bins": [0, 15, 65536],
+            "q_step_size": [0, -1, np.inf, np.nan, 10, 0.00001],
+            "two_theta_step_size": [0, -1, np.inf, np.nan],
             "iterations": [0, -1],
-            "theta_bins": [0],
             "overlap_min_bins": [0],
             "jpeg_dpi": [0],
             "saturation": [0, -1, np.inf, np.nan],
@@ -305,7 +318,9 @@ class LifecycleTests(TemporaryCase):
 
     def test_invalid_arguments_are_reported_inside_inputs_stage(self):
         directory = self.root / "invalid"
-        self.assertEqual(cli_main.main(self.argv(directory, "--theta-bins", "0")), 1)
+        self.assertEqual(
+            cli_main.main(self.argv(directory, "--two-theta-step-size", "0")), 1
+        )
         report = strict_json(directory / "report.json")
         self.assertEqual(report["status"], "failed")
         self.assertEqual(report["error"]["type"], "ValueError")
@@ -798,10 +813,10 @@ class SyntheticExtractionTests(TemporaryCase):
                     directory,
                     "--validation",
                     "basic",
-                    "--fit-bins",
-                    "16",
-                    "--theta-bins",
-                    "8",
+                    "--q-step-size",
+                    "1.875",
+                    "--two-theta-step-size",
+                    "6.25",
                 )
             )
             cache_builder = cast(MagicMock, workflow.build_cache)
@@ -867,10 +882,10 @@ class SyntheticExtractionTests(TemporaryCase):
                 directory,
                 "--validation",
                 "basic",
-                "--fit-bins",
-                "16",
-                "--theta-bins",
-                "8",
+                "--q-step-size",
+                "1.875",
+                "--two-theta-step-size",
+                "6.25",
             )
             option = argv.index("--geometry")
             del argv[option : option + 2]
@@ -912,10 +927,10 @@ class SyntheticExtractionTests(TemporaryCase):
                     directory,
                     "--validation",
                     "basic",
-                    "--fit-bins",
-                    "16",
-                    "--theta-bins",
-                    "8",
+                    "--q-step-size",
+                    "1.875",
+                    "--two-theta-step-size",
+                    "6.25",
                 )
             )
         writer.assert_called_once()

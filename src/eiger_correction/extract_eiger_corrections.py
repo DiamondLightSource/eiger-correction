@@ -146,9 +146,19 @@ def parser() -> argparse.ArgumentParser:
         metavar=("LOW", "HIGH"),
         help="Detector-fit Q bounds in reciprocal angstroms (A^-1)",
     )
-    result.add_argument("--fit-bins", type=int, default=1200)
+    result.add_argument(
+        "--q-step-size",
+        type=float,
+        default=0.025,
+        help="Target Q bin width in A^-1 for fitting and final extraction",
+    )
     result.add_argument("--iterations", type=int, default=10)
-    result.add_argument("--theta-bins", type=int, default=2001)
+    result.add_argument(
+        "--two-theta-step-size",
+        type=float,
+        default=0.025,
+        help="Target 2theta bin width in degrees",
+    )
     result.add_argument(
         "--theta-max",
         type=float,
@@ -255,12 +265,19 @@ def check_arguments(args: argparse.Namespace) -> None:
         low, high = getattr(args, name)
         if not np.all(np.isfinite([low, high])) or not low < high:
             raise ValueError(f"{name} requires finite increasing bounds")
-    if args.fit_q_range[0] <= 0 or not 16 <= args.fit_bins <= 65535:
-        raise ValueError("Positive fit Q bounds and 16..65535 fit bins required")
-    for name in ("iterations", "theta_bins", "overlap_min_bins", "jpeg_dpi"):
+    if args.fit_q_range[0] <= 0:
+        raise ValueError("Positive fit Q bounds required")
+    for name in ("iterations", "overlap_min_bins", "jpeg_dpi"):
         if getattr(args, name) < 1:
             raise ValueError(f"{name} must be positive")
-    for name in ("saturation", "density", "overlap_min_pixels", "overlap_floor"):
+    for name in (
+        "saturation",
+        "density",
+        "overlap_min_pixels",
+        "overlap_floor",
+        "q_step_size",
+        "two_theta_step_size",
+    ):
         if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             raise ValueError(f"{name} must be finite and positive")
     if not np.isfinite(args.angle_tolerance) or args.angle_tolerance < 0:
@@ -269,6 +286,20 @@ def check_arguments(args: argparse.Namespace) -> None:
         raise ValueError("theta_max must be 0 (automatic) or in (0, 180]")
     if not np.isfinite(args.polarization) or not -1 <= args.polarization <= 1:
         raise ValueError("polarization must be finite and in [-1, 1]")
+    if not 16 <= radial_bins(tuple(args.fit_q_range), args.q_step_size) <= 65535:
+        raise ValueError("Fit Q range and q_step_size must produce 16..65535 bins")
+
+
+def radial_bins(limits: tuple[float, float], step: float) -> int:
+    """Cover exact endpoints with uniform bins no wider than the target step."""
+    width = limits[1] - limits[0]
+    if not np.isfinite(width) or width <= 0 or not np.isfinite(step) or step <= 0:
+        raise ValueError("Radial range and step must be finite and positive")
+    count = width / step
+    if not np.isfinite(count) or count > np.iinfo(np.int32).max:
+        raise ValueError("Radial step requests too many bins")
+    # Avoid an extra bin due solely to floating-point division at an integer.
+    return max(1, int(np.ceil(np.nextafter(count, -np.inf))))
 
 
 def integrate_theta(
@@ -398,8 +429,8 @@ def integrate_output(
     fit: Mapping[str, Any],
     base_mask: BoolArray,
     theta_range: tuple[float, float],
-    theta_npt: int,
-    q_npt: int,
+    theta_step: float,
+    q_step: float,
     gains: NDArray[np.floating[Any]],
 ) -> Payload:
     """Integrate final grids with frozen corrections; never refit on cropped data."""
@@ -421,8 +452,8 @@ def integrate_output(
         },
         model,
         q_range=(0.0, float(q_max_nm)),
-        q_npt=q_npt,
-        theta_npt=theta_npt,
+        q_npt=radial_bins((0.0, float(q_max_nm / 10)), q_step),
+        theta_npt=radial_bins(theta_range, theta_step),
         theta_range=theta_range,
         saturation=np.inf,
     )
@@ -520,6 +551,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
         # Scientific fitting and saved calibration settings retain nm^-1.
         # Convert once at the CLI boundary, without mutating recorded arguments.
         fit_q_range = (float(args.fit_q_range[0] * 10), float(args.fit_q_range[1] * 10))
+        fit_bins = radial_bins(tuple(args.fit_q_range), args.q_step_size)
         geometry, geometry_provenance = load_geometry(args.scan, args.geometry)
         record.data["inputs"] = {"scan": args.scan.resolve(), **geometry_provenance}
         raw = workflow.load_scan(args.scan, args.detector, args.monitor, args.metadata)
@@ -618,16 +650,14 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
             base_mask = scan.native_mask | boundary
             sensors[base_mask] = -1
             vertical = model.vertical_check()
-            workflow.constant_pattern_check(
-                model, base_mask, fit_q_range, args.fit_bins
-            )
+            workflow.constant_pattern_check(model, base_mask, fit_q_range, fit_bins)
             record.data["geometry_checks"] = {
                 "vertical": vertical,
                 "constant_pattern": "passed",
                 "fixed_mask_pixels": int(base_mask.sum()),
             }
         options: dict[str, Any] = {
-            "npt": args.fit_bins,
+            "npt": fit_bins,
             "iterations": args.iterations,
             "fit_frame_gains": True,
             "fractional_floor": 0.003,
@@ -640,6 +670,8 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
             **options,
             "q_range": fit_q_range,
             "q_range_unit": "nm^-1",
+            "q_step_size_angstrom_inverse": args.q_step_size,
+            "two_theta_step_size_deg": args.two_theta_step_size,
             "azimuth_range_deg": azimuth,
             "angle_aggregation": {
                 "enabled": True,
@@ -656,7 +688,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 model,
                 base_mask,
                 fit_q_range,
-                args.fit_bins,
+                fit_bins,
                 saturation=np.inf,
             )
             indices = np.array(sorted(cache), dtype=int)
@@ -694,7 +726,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                         test,
                         base_mask,
                         fit_q_range,
-                        args.fit_bins,
+                        fit_bins,
                         saturation=np.inf,
                         validate_frame_gains=args.validation == "full",
                     )
@@ -759,8 +791,9 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 model,
                 base_mask | fit["bad_pixel_mask"],
             )
+            theta_bins = radial_bins(theta_range, args.two_theta_step_size)
             unity = integrate_theta(
-                scan, model, fit, base_mask, theta_range, args.theta_bins, sizes
+                scan, model, fit, base_mask, theta_range, theta_bins, sizes
             )
             record.data["theta_range_deg"] = theta_range
         with record.stage("overlap_scales"):
@@ -790,7 +823,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                     fit,
                     final,
                     theta_range,
-                    args.theta_bins,
+                    theta_bins,
                     args.saturation,
                 )
         else:
@@ -808,8 +841,8 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 fit,
                 base_mask,
                 output_range,
-                args.theta_bins,
-                args.fit_bins,
+                args.two_theta_step_size,
+                args.q_step_size,
                 final["frame_gains"],
             )
             record.data["output_theta_range_deg"] = output_range

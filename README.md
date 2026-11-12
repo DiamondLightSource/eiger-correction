@@ -96,8 +96,10 @@ them. If the detector file is absent, frames are read from
 |---|---|---|
 | Azimuth | Single inclusive pyFAI chi wedge 67.5–112.5° | `--azimuth-range LOW HIGH`; `--all-azimuths` disables |
 | Detector-fit Q interval | 10–40 Å⁻¹ | `--fit-q-range LOW HIGH` |
-| Fit bins / iterations | 1200 / 10 | `--fit-bins`, `--iterations` |
-| Final 2theta grid | 2001 bins, 0–80° | `--theta-bins`, `--theta-max` |
+| Fit and final Q target step | 0.025 Å⁻¹ | `--q-step-size` |
+| Fit iterations | 10 | `--iterations` |
+| Processing and final 2theta target step | 0.025° | `--two-theta-step-size` |
+| Final 2theta range | 0–80° | `--theta-max` |
 | Angle grouping tolerance | 0.001° | `--angle-tolerance`; zero means exact repeats |
 | Raw saturation threshold | 10⁷ | `--saturation` |
 | Overlap support | 100 pixel weight, 20 shared bins | `--overlap-min-pixels`, `--overlap-min-bins` |
@@ -114,6 +116,11 @@ only the final output integrations, never detector fitting or overlap scales.
 Restrictive azimuth wedges can still disconnect the overlap graph: this is a hard failure, with no silent
 threshold relaxation or fallback. Chi bounds are inclusive; seam-crossing bounds
 such as 170, −170 are supported. The opposite wedge is not implicitly included.
+
+Bin counts are derived as `ceil((upper - lower) / step)`, retaining exact range
+endpoints. Actual uniform bin widths are therefore at most the requested step.
+The fit grid must contain 16–65535 bins. The former `--fit-bins` and
+`--theta-bins` options are replaced by the step-size options.
 
 ## Outputs and unattended operation
 
