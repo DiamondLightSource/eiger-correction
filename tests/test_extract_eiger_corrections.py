@@ -132,9 +132,10 @@ class ArgumentTests(TemporaryCase):
         self.assertEqual(args.fit_q_range, (10.0, 40.0))
         self.assertEqual(args.q_step_size, 0.025)
         self.assertEqual(args.two_theta_step_size, 0.025)
+        self.assertIsNone(args.q_max)
         for values in (
-            {"theta_max": 0.0, "angle_tolerance": 0.0, "polarization": -1.0},
-            {"theta_max": 180.0, "polarization": 1.0},
+            {"q_max": None, "angle_tolerance": 0.0, "polarization": -1.0},
+            {"q_max": 40.0, "polarization": 1.0},
         ):
             with self.subTest(values=values):
                 cli.check_arguments(stub(**{**vars(args), **values}))
@@ -147,6 +148,7 @@ class ArgumentTests(TemporaryCase):
             self.argv(None, "--q-step-size", "abc"),
             self.argv(None, "--fit-bins", "100"),
             self.argv(None, "--theta-bins", "100"),
+            self.argv(None, "--theta-max", "80"),
             self.argv(None, "--azimuth-range", "20"),
             self.argv(None, "--unknown-option"),
         ]
@@ -179,7 +181,7 @@ class ArgumentTests(TemporaryCase):
             "overlap_min_pixels": [0, -1, np.inf, np.nan],
             "overlap_floor": [0, -1, np.inf, np.nan],
             "angle_tolerance": [-1, np.inf, np.nan],
-            "theta_max": [-1, 181, np.inf, np.nan],
+            "q_max": [0, -1, np.inf, np.nan],
             "polarization": [-1.01, 1.01, np.inf, np.nan],
         }
         for field, values in cases.items():
@@ -791,9 +793,10 @@ class SyntheticExtractionTests(TemporaryCase):
         with ExitStack() as stack:
             unity, _ = self.synthetic_workflow(stack)
             limits = cast(MagicMock, workflow.theta_range_for_scan)
-            limits.side_effect = [(0.0, 100.0), (0.0, 35.0)]
+            limits.return_value = (0.0, 100.0)
+            q_max = 4 * np.pi * np.sin(np.deg2rad(35) / 2)
             code = cli_main.main(
-                self.argv(directory, "--validation", "basic", "--theta-max", "35")
+                self.argv(directory, "--validation", "basic", "--q-max", str(q_max))
             )
             self.assertEqual(code, 0, (directory / "run.log").read_text())
             integration = cast(MagicMock, cli.integrate_theta)
@@ -802,7 +805,23 @@ class SyntheticExtractionTests(TemporaryCase):
             scales = cast(MagicMock, workflow.refine_position_scales)
             self.assertIs(scales.call_args.args[0], unity["groups"]["merged_2theta"])
             output = cast(MagicMock, workflow.process_scan)
-            self.assertEqual(output.call_args.kwargs["theta_range"], (0.0, 35.0))
+            np.testing.assert_allclose(
+                output.call_args.kwargs["theta_range"], (0.0, 35.0)
+            )
+            np.testing.assert_allclose(
+                output.call_args.kwargs["q_range"], (0.0, q_max * 10)
+            )
+
+    def test_q_limit_conversion_and_physical_bounds(self):
+        full = (0.0, 85.0)
+        self.assertEqual(cli.output_theta_range(None, 1e-10, full), full)
+        np.testing.assert_allclose(
+            cli.output_theta_range(2 * np.pi, 1e-10, full), (0, 60)
+        )
+        self.assertEqual(cli.output_theta_range(4 * np.pi, 1e-10, full), (0, 180))
+        for value in (0, -1, np.inf, np.nan, 4 * np.pi + 0.01):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                cli.output_theta_range(value, 1e-10, full)
 
     def test_end_to_end_synthetic_extraction_real_exports(self):
         directory = self.root / "extracted"

@@ -99,7 +99,7 @@ them. If the detector file is absent, frames are read from
 | Fit and final Q target step | 0.025 Å⁻¹ | `--q-step-size` |
 | Fit iterations | 10 | `--iterations` |
 | Processing and final 2theta target step | 0.025° | `--two-theta-step-size` |
-| Final 2theta range | 0–80° | `--theta-max` |
+| Final Q range | 0 to unmasked pyFAI maximum | `--q-max` (Å⁻¹) |
 | Angle grouping tolerance | 0.001° | `--angle-tolerance`; zero means exact repeats |
 | Raw saturation threshold | 10⁷ | `--saturation` |
 | Overlap support | 100 pixel weight, 20 shared bins | `--overlap-min-pixels`, `--overlap-min-bins` |
@@ -110,7 +110,9 @@ them. If the detector file is absent, frames are read from
 | CdTe density | 6.2 g/cm³ | `--density` |
 | JPEG resolution | 140 dpi | `--jpeg-dpi` |
 
-`--theta-max 0` selects the maximum finite unmasked pyFAI pixel-centre angle
+`--q-max` sets the final maximum Q in Å⁻¹; the corresponding 2theta maximum is
+calculated using the scan wavelength: `2theta = 2 asin(Q * wavelength / (4*pi))`.
+Omitting it selects the maximum finite unmasked pyFAI pixel-centre angle
 across the scan, including the per-position azimuth selection. This limit affects
 only the final output integrations, never detector fitting or overlap scales.
 Restrictive azimuth wedges can still disconnect the overlap graph: this is a hard failure, with no silent
@@ -120,7 +122,8 @@ such as 170, −170 are supported. The opposite wedge is not implicitly included
 Bin counts are derived as `ceil((upper - lower) / step)`, retaining exact range
 endpoints. Actual uniform bin widths are therefore at most the requested step.
 The fit grid must contain 16–65535 bins. The former `--fit-bins` and
-`--theta-bins` options are replaced by the step-size options.
+`--theta-bins` options are replaced by the step-size options; `--theta-max`
+is replaced by `--q-max`.
 
 ## Outputs and unattended operation
 

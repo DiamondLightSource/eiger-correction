@@ -160,11 +160,12 @@ def parser() -> argparse.ArgumentParser:
         help="Target 2theta bin width in degrees",
     )
     result.add_argument(
-        "--theta-max",
+        "--q-max",
         type=float,
-        default=80.0,
+        default=None,
         help=(
-            "Upper 2theta in degrees; 0 selects automatic unmasked pixel-centre maximum"
+            "Final-output maximum Q in A^-1; default: unmasked pyFAI maximum. "
+            "Does not limit detector fitting or overlap refinement"
         ),
     )
     result.add_argument("--angle-tolerance", type=float, default=0.001)
@@ -282,8 +283,8 @@ def check_arguments(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be finite and positive")
     if not np.isfinite(args.angle_tolerance) or args.angle_tolerance < 0:
         raise ValueError("angle_tolerance must be finite and nonnegative")
-    if not np.isfinite(args.theta_max) or not 0 <= args.theta_max <= 180:
-        raise ValueError("theta_max must be 0 (automatic) or in (0, 180]")
+    if args.q_max is not None and (not np.isfinite(args.q_max) or args.q_max <= 0):
+        raise ValueError("q_max must be None or finite and positive (A^-1)")
     if not np.isfinite(args.polarization) or not -1 <= args.polarization <= 1:
         raise ValueError("polarization must be finite and in [-1, 1]")
     if not 16 <= radial_bins(tuple(args.fit_q_range), args.q_step_size) <= 65535:
@@ -300,6 +301,18 @@ def radial_bins(limits: tuple[float, float], step: float) -> int:
         raise ValueError("Radial step requests too many bins")
     # Avoid an extra bin due solely to floating-point division at an integer.
     return max(1, int(np.ceil(np.nextafter(count, -np.inf))))
+
+
+def output_theta_range(
+    q_max: float | None, wavelength_m: float, full_range: tuple[float, float]
+) -> tuple[float, float]:
+    """Convert the output-only Q limit (A^-1) to 2theta degrees."""
+    if q_max is None:
+        return full_range
+    sine = q_max * (wavelength_m * 1e10) / (4 * np.pi)
+    if not np.isfinite(sine) or not 0 < sine <= 1:
+        raise ValueError("q_max must be positive and no greater than 4*pi/wavelength")
+    return 0.0, float(np.rad2deg(2 * np.arcsin(sine)))
 
 
 def integrate_theta(
@@ -474,6 +487,8 @@ def save_xy(directory: Path, processed: Mapping[str, Any]) -> dict[str, str]:
     ):
         group = processed["groups"][name]
         supported = (group["accumulators"][1] > 0) & np.isfinite(group["intensity"])
+        if not supported.any():
+            raise ValueError(f"No supported final output bins in {name}")
         xy = np.column_stack((group["axis"][supported], group["intensity"][supported]))
         filename = f"pattern_{suffix}.xy"
         with (directory / filename).open("x", encoding="ascii") as stream:
@@ -829,11 +844,8 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
         else:
             record.data["raw_audit"] = {"status": "not_requested"}
         with record.stage("final_integration"):
-            output_range = workflow.theta_range_for_scan(
-                scan,
-                model,
-                base_mask | fit["bad_pixel_mask"],
-                theta_max=args.theta_max or None,
+            output_range = output_theta_range(
+                args.q_max, model.geometry.wavelength, theta_range
             )
             output = integrate_output(
                 scan,
