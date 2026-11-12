@@ -392,6 +392,73 @@ def check_conservation(
     }
 
 
+def integrate_output(
+    scan: Scan,
+    model: PhysicalModel,
+    fit: Mapping[str, Any],
+    base_mask: BoolArray,
+    theta_range: tuple[float, float],
+    theta_npt: int,
+    q_npt: int,
+    gains: NDArray[np.floating[Any]],
+) -> Payload:
+    """Integrate final grids with frozen corrections; never refit on cropped data."""
+    import eiger_correction.eiger_workflow as workflow
+
+    q_max_nm = (
+        4
+        * np.pi
+        * np.sin(np.deg2rad(theta_range[1]) / 2)
+        / (model.geometry.wavelength * 1e9)
+    )
+    unity = workflow.process_scan(
+        scan,
+        {
+            "fit_settings": {"q_range": fit["q_range"]},
+            "base_mask": base_mask,
+            "bad_pixel_mask": fit["bad_pixel_mask"],
+            "combined_divisor": fit["combined_divisor"],
+        },
+        model,
+        q_range=(0.0, float(q_max_nm)),
+        q_npt=q_npt,
+        theta_npt=theta_npt,
+        theta_range=theta_range,
+        saturation=np.inf,
+    )
+    # Results are redundant once the merge and per-position accumulators exist.
+    unity.pop("results", None)
+    output = workflow.apply_position_scales(unity, gains)
+    output["groups"]["merged_q"]["axis"] = output["groups"]["merged_q"]["axis"] / 10
+    output["groups"]["merged_q"]["unit"] = "q_A^-1"
+    return output
+
+
+def save_xy(directory: Path, processed: Mapping[str, Any]) -> dict[str, str]:
+    """Write supported bins of both independently integrated radial grids."""
+    outputs = {}
+    for name, suffix, label in (
+        ("merged_2theta", "tth", "2theta_deg"),
+        ("merged_q", "q", "q_A^-1"),
+    ):
+        group = processed["groups"][name]
+        supported = (group["accumulators"][1] > 0) & np.isfinite(group["intensity"])
+        xy = np.column_stack((group["axis"][supported], group["intensity"][supported]))
+        filename = f"pattern_{suffix}.xy"
+        with (directory / filename).open("x", encoding="ascii") as stream:
+            np.savetxt(
+                stream,
+                xy,
+                fmt="%.10g",
+                header=f"{label} intensity; two_stage_overlap; measured I0 retained",
+            )
+        np.testing.assert_allclose(
+            np.loadtxt(directory / filename, ndmin=2), xy, rtol=6e-10, atol=1e-12
+        )
+        outputs[f"xy_{suffix}"] = filename
+    return outputs
+
+
 def raw_audit(
     workflow: ModuleType,
     raw: Scan,
@@ -452,7 +519,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
         check_arguments(args)
         # Scientific fitting and saved calibration settings retain nm^-1.
         # Convert once at the CLI boundary, without mutating recorded arguments.
-        fit_q_range = tuple(float(value * 10) for value in args.fit_q_range)
+        fit_q_range = (float(args.fit_q_range[0] * 10), float(args.fit_q_range[1] * 10))
         geometry, geometry_provenance = load_geometry(args.scan, args.geometry)
         record.data["inputs"] = {"scan": args.scan.resolve(), **geometry_provenance}
         raw = workflow.load_scan(args.scan, args.detector, args.monitor, args.metadata)
@@ -691,7 +758,6 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 scan,
                 model,
                 base_mask | fit["bad_pixel_mask"],
-                theta_max=args.theta_max or None,
             )
             unity = integrate_theta(
                 scan, model, fit, base_mask, theta_range, args.theta_bins, sizes
@@ -729,13 +795,31 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 )
         else:
             record.data["raw_audit"] = {"status": "not_requested"}
+        with record.stage("final_integration"):
+            output_range = workflow.theta_range_for_scan(
+                scan,
+                model,
+                base_mask | fit["bad_pixel_mask"],
+                theta_max=args.theta_max or None,
+            )
+            output = integrate_output(
+                scan,
+                model,
+                fit,
+                base_mask,
+                output_range,
+                args.theta_bins,
+                args.fit_bins,
+                final["frame_gains"],
+            )
+            record.data["output_theta_range_deg"] = output_range
         with record.stage("exports"):
             settings.update(
                 position_scale_model="two_stage_overlap",
                 refine_all_position_scales=True,
                 position_scale_refinement={
                     **scale_fit["settings"],
-                    "range": "full exported 2theta range",
+                    "range": "full unmasked scan 2theta range; independent of output crop",
                     "theta_range_deg": theta_range,
                     "gauge": scale_fit["gauge"],
                     "replaces_stage1_gains": True,
@@ -775,34 +859,12 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 calibration["frame_gains"], final["frame_gains"]
             )
             workflow.save_processed(
-                directory / "pattern.h5", scan, calibration, model, final
-            )
-            group = final["groups"]["merged_2theta"]
-            supported = (group["accumulators"][1] > 0) & np.isfinite(group["intensity"])
-            xy = np.column_stack(
-                (group["axis"][supported], group["intensity"][supported])
-            )
-            with (directory / "pattern_2theta.xy").open(
-                "x", encoding="ascii"
-            ) as stream:
-                np.savetxt(
-                    stream,
-                    xy,
-                    fmt="%.10g",
-                    header=(
-                        "2theta_deg intensity; two_stage_overlap; measured I0 retained"
-                    ),
-                )
-            np.testing.assert_allclose(
-                np.loadtxt(directory / "pattern_2theta.xy", ndmin=2),
-                xy,
-                rtol=6e-10,
-                atol=1e-12,
+                directory / "pattern.h5", scan, calibration, model, output
             )
             record.data["outputs"] = {
                 "calibration": calibration_path.name,
                 "pattern": "pattern.h5",
-                "xy": "pattern_2theta.xy",
+                **save_xy(directory, output),
                 "log": "run.log",
             }
         with record.stage("jpeg_diagnostics"):

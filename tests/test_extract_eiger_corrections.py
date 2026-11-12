@@ -759,6 +759,9 @@ class SyntheticExtractionTests(TemporaryCase):
         for name, options in mocks.items():
             stack.enter_context(patch.object(workflow, name, **options))
         stack.enter_context(patch.object(cli, "integrate_theta", return_value=unity))
+        output = copy.deepcopy(unity)
+        output["groups"]["merged_q"] = copy.deepcopy(unity["groups"]["merged_2theta"])
+        stack.enter_context(patch.object(workflow, "process_scan", return_value=output))
         stack.enter_context(
             patch.object(
                 diagnostics,
@@ -767,6 +770,24 @@ class SyntheticExtractionTests(TemporaryCase):
             )
         )
         return unity, fit
+
+    def test_output_crop_does_not_change_scale_integration(self):
+        directory = self.root / "cropped"
+        with ExitStack() as stack:
+            unity, _ = self.synthetic_workflow(stack)
+            limits = cast(MagicMock, workflow.theta_range_for_scan)
+            limits.side_effect = [(0.0, 100.0), (0.0, 35.0)]
+            code = cli_main.main(
+                self.argv(directory, "--validation", "basic", "--theta-max", "35")
+            )
+            self.assertEqual(code, 0, (directory / "run.log").read_text())
+            integration = cast(MagicMock, cli.integrate_theta)
+            self.assertEqual(integration.call_args.args[4], (0.0, 100.0))
+            self.assertNotIn("theta_max", limits.call_args_list[0].kwargs)
+            scales = cast(MagicMock, workflow.refine_position_scales)
+            self.assertIs(scales.call_args.args[0], unity["groups"]["merged_2theta"])
+            output = cast(MagicMock, workflow.process_scan)
+            self.assertEqual(output.call_args.kwargs["theta_range"], (0.0, 35.0))
 
     def test_end_to_end_synthetic_extraction_real_exports(self):
         directory = self.root / "extracted"
@@ -783,7 +804,8 @@ class SyntheticExtractionTests(TemporaryCase):
                     "8",
                 )
             )
-            self.assertEqual(workflow.build_cache.call_args.args[3], (100.0, 400.0))
+            cache_builder = cast(MagicMock, workflow.build_cache)
+            self.assertEqual(cache_builder.call_args.args[3], (100.0, 400.0))
         self.assert_exports(directory, code, unity, fit)
         with h5py.File(directory / "pattern.h5", "r") as target:
             entry = h5_group(target, str(target.attrs["default"]))
@@ -800,6 +822,20 @@ class SyntheticExtractionTests(TemporaryCase):
             self.assertEqual(group["intensity"].attrs["interpretation"], "spectrum")
             self.assertEqual(group["intensity"].attrs["signal"], 1)
             self.assertEqual(group["intensity_errors"].id, group["sigma"].id)
+            q_group = h5_group(entry, "merged_q")
+            self.assertEqual(q_group.attrs["unit"], "q_A^-1")
+            self.assertEqual(q_group["q_angstrom"].attrs["units"], "angstrom^-1")
+            np.testing.assert_allclose(
+                h5_dataset(q_group, "q_angstrom")[()],
+                unity["groups"]["merged_2theta"]["axis"] / 10,
+            )
+            q_xy = np.loadtxt(directory / "pattern_q.xy")
+            np.testing.assert_allclose(
+                q_xy[:, 0], h5_dataset(q_group, "q_angstrom")[()], rtol=6e-10
+            )
+            np.testing.assert_allclose(
+                q_xy[:, 1], h5_dataset(q_group, "intensity")[()], rtol=6e-10
+            )
         with h5py.File(directory / "detector_corrections.h5", "r") as target:
             entry = h5_group(target, str(target.attrs["default"]))
             self.assertEqual(entry.attrs["NX_class"], "NXentry")
@@ -914,7 +950,7 @@ class SyntheticExtractionTests(TemporaryCase):
                 h5_dataset(group, "frame_accumulators")[()].sum(axis=0),
                 expected["accumulators"],
             )
-        xy = np.loadtxt(directory / "pattern_2theta.xy")
+        xy = np.loadtxt(directory / "pattern_tth.xy")
         np.testing.assert_allclose(xy[:, 0], expected["axis"], rtol=6e-10)
         np.testing.assert_allclose(xy[:, 1], expected["intensity"], rtol=6e-10)
         with h5py.File(directory / "detector_corrections.h5", "r") as target:
@@ -944,7 +980,7 @@ class SyntheticExtractionTests(TemporaryCase):
         self.assertEqual(report["stages"]["aggregation"]["status"], "passed")
         self.assertEqual(report["error"]["message"], "synthetic fit failure")
         self.assertFalse(list(directory.glob(".grouped_*")))
-        self.assertFalse((directory / "pattern_2theta.xy").exists())
+        self.assertFalse((directory / "pattern_tth.xy").exists())
 
 
 if __name__ == "__main__":

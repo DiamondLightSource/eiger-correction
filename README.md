@@ -31,7 +31,8 @@ This writes the following to the output directory:
 ```text
 detector_corrections.h5   # detector calibration
 pattern.h5                # final integrated pattern
-pattern_2theta.xy         # two-column 2theta / intensity
+pattern_tth.xy            # two-column 2theta (degrees) / intensity
+pattern_q.xy              # two-column Q (angstrom^-1) / intensity
 angle_grouping.jpg
 azimuth_geometry.jpg
 detector_response.jpg
@@ -108,8 +109,9 @@ them. If the detector file is absent, frames are read from
 | JPEG resolution | 140 dpi | `--jpeg-dpi` |
 
 `--theta-max 0` selects the maximum finite unmasked pyFAI pixel-centre angle
-across the scan, including the per-position azimuth selection. Narrower ranges or
-wedges can disconnect the overlap graph: this is a hard failure, with no silent
+across the scan, including the per-position azimuth selection. This limit affects
+only the final output integrations, never detector fitting or overlap scales.
+Restrictive azimuth wedges can still disconnect the overlap graph: this is a hard failure, with no silent
 threshold relaxation or fallback. Chi bounds are inclusive; seam-crossing bounds
 such as 170, −170 are supported. The opposite wedge is not implicitly included.
 
@@ -128,16 +130,18 @@ Every run directory contains:
 - **Calibration HDF5** (`detector_corrections.h5`): detector/pixel/sensor divisors, fixed masks, geometry,
 	physical model, fit history and settings, held-out results, final source-only
 	position gains, and separately labelled stage-1 nuisance gains.
-- **Pattern HDF5** (`pattern.h5`): final 2theta axis, intensity, conditional Poisson sigma,
+- **Pattern HDF5** (`pattern.h5`): independently integrated final 2theta (degrees) and
+	Q (Å⁻¹) grids in `entry/merged_2theta` and `entry/merged_q` (`q_angstrom` axis),
+	intensity, conditional Poisson sigma,
 	signal/normalization/variance/pixel-weight accumulators per position and merged,
-	fit-range flags, angles, I0, gains and applied corrections. There is deliberately
-	no redundant Q integration.
-- **Two-column XY** (`pattern_2theta.xy`): 2theta degrees and intensity, ten significant digits;
+	fit-range flags, angles, I0, gains and applied corrections.
+- **Two-column XY** (`pattern_tth.xy`, `pattern_q.xy`): 2theta degrees or Q (Å⁻¹)
+  and intensity, ten significant digits;
 	unsupported bins are omitted, not filled or interpolated.
 - **Seven JPEGs:** actual angle grouping; geometry-only azimuth masks; response
 	maps/sensor gains/monitors; Q sampling; stage-1/final gains; full/zoom intensity;
-	final overlap panels A–B **after final applied gains**, using the same final
-	integration as the exported pattern. Unsupported intervals are recorded as skips
+	 final overlap panels A–B **after final applied gains**, using the full processing
+	 range, independent of the output crop. Unsupported intervals are recorded as skips
 	and warnings rather than invalidating an otherwise supported extraction.
 	The overlap figure notes that individual curves may spike where few pixels
 	contribute; A retains all supported bins, while B uses the diagnostic
@@ -184,12 +188,13 @@ can contain partial products; only accept a completed report.
 	 overlaps. The graph must connect every position; the equal-position geometric
 	 mean scale is one. Final scales **replace**, not multiply, nuisance scales.
 	 Apply them to normalization accumulators only and rebuild the merge.
-5. Export, read back/check outputs, and render JPEGs from existing results.
+5. Reintegrate the requested final range on independent uniform Q and 2theta grids,
+   apply the frozen gains, export, read back/check outputs, and render full-range JPEGs.
 
 Removed notebook-only work: the low-angle raw-image mask preview, full raw-data
 reread for sampling plots, separate-versus-summed exploratory integrations,
-ungrouped benchmark, duplicate grouping preview algorithm, and duplicate Q
-integration. Residual diagnostics are reused rather than recomputed for the stack.
+ungrouped benchmark and duplicate grouping preview algorithm.
+Residual diagnostics are reused rather than recomputed for the stack.
 One raw source pass is necessary for aggregation; later fitting/validation and
 integration read the much smaller temporary grouped file. `--raw-audit` explicitly
 adds a small independent source reread. No smoothing, tapering, background
