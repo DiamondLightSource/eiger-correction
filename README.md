@@ -99,7 +99,7 @@ them. If the detector file is absent, frames are read from
 | Fit and final Q target step | 0.025 Å⁻¹ | `--q-step-size` |
 | Fit iterations | 10 | `--iterations` |
 | Processing and final 2theta target step | 0.025° | `--two-theta-step-size` |
-| Final Q range | 0 to unmasked pyFAI maximum | `--q-max` (Å⁻¹) |
+| Final Q range | 0 to NeXus Q maximum, or unmasked pyFAI maximum | `--q-max` (Å⁻¹) |
 | Angle grouping tolerance | 0.001° | `--angle-tolerance`; zero means exact repeats |
 | Raw saturation threshold | 10⁷ | `--saturation` |
 | Overlap support | 100 pixel weight, 20 shared bins | `--overlap-min-pixels`, `--overlap-min-bins` |
@@ -112,8 +112,12 @@ them. If the detector file is absent, frames are read from
 
 `--q-max` sets the final maximum Q in Å⁻¹; the corresponding 2theta maximum is
 calculated using the scan wavelength: `2theta = 2 asin(Q * wavelength / (4*pi))`.
-Omitting it selects the maximum finite unmasked pyFAI pixel-centre angle
-across the scan, including the per-position azimuth selection. This limit affects
+Omitting it (Python `None`) reads `/entry/plan_metadata/experiment_definition/data/q_max`
+in the input NeXus file, also in Å⁻¹. Missing or empty metadata (null dataset,
+empty array or blank string) falls back to the maximum finite unmasked pyFAI
+pixel-centre angle across the scan, including the per-position azimuth selection.
+Nonempty invalid metadata fails clearly; an explicit `--q-max` takes precedence.
+The chosen limit and its source are recorded in the reports. This limit affects
 only the final output integrations, never detector fitting or overlap scales.
 Restrictive azimuth wedges can still disconnect the overlap graph: this is a hard failure, with no silent
 threshold relaxation or fallback. Chi bounds are inclusive; seam-crossing bounds

@@ -330,6 +330,44 @@ class LifecycleTests(TemporaryCase):
         self.assertFalse(list(directory.glob(".grouped_*")))
 
 
+class QMaxInputTests(TemporaryCase):
+    dataset = "/entry/plan_metadata/experiment_definition/data/q_max"
+
+    def test_explicit_override_does_not_read_nexus(self):
+        self.assertEqual(
+            cli.resolve_q_max(self.root / "nonexistent.nxs", 20), (20, "cli")
+        )
+
+    def test_missing_and_empty_metadata_use_pyfai_maximum(self):
+        path = self.root / "scan.nxs"
+        for value in (None, h5py.Empty("f"), np.array([]), "", b"  "):
+            with self.subTest(value=value):
+                with h5py.File(path, "w") as source:
+                    if value is not None:
+                        source[self.dataset] = value
+                self.assertEqual(cli.resolve_q_max(path), (None, "pyfai"))
+
+    def test_scalar_singleton_and_string_metadata_in_angstrom_inverse(self):
+        path = self.root / "scan.nxs"
+        for value in (25.0, [25.0], "25.0", b"25.0"):
+            with self.subTest(value=value):
+                with h5py.File(path, "w") as source:
+                    source[self.dataset] = value
+                self.assertEqual(
+                    cli.resolve_q_max(path), (25.0, f"nexus:{self.dataset}")
+                )
+
+    def test_nonempty_invalid_metadata_is_not_silently_ignored(self):
+        path = self.root / "scan.nxs"
+        for value in (0, -1, np.nan, np.inf, "nonsense", [20, 30]):
+            with self.subTest(value=value):
+                with h5py.File(path, "w") as source:
+                    source[self.dataset] = value
+                with self.assertRaises(ValueError):
+                    cli.resolve_q_max(path)
+                self.assertEqual(cli.resolve_q_max(path, 20.0), (20.0, "cli"))
+
+
 class GeometryInputTests(TemporaryCase):
     def write_embedded(self, value):
         path = self.root / "scan.nxs"
@@ -811,6 +849,24 @@ class SyntheticExtractionTests(TemporaryCase):
             np.testing.assert_allclose(
                 output.call_args.kwargs["q_range"], (0.0, q_max * 10)
             )
+
+    def test_nexus_limit_only_controls_final_output(self):
+        directory = self.root / "nexus_crop"
+        with ExitStack() as stack:
+            self.synthetic_workflow(stack)
+            with h5py.File(self.root / "scan.nxs", "r+") as source:
+                source[QMaxInputTests.dataset] = 4.0
+            code = cli_main.main(self.argv(directory, "--validation", "basic"))
+            self.assertEqual(code, 0, (directory / "run.log").read_text())
+            output = cast(MagicMock, workflow.process_scan)
+            np.testing.assert_allclose(output.call_args.kwargs["q_range"], (0.0, 40.0))
+            scales = cast(MagicMock, cli.integrate_theta)
+            self.assertEqual(scales.call_args.args[4], (30.0, 80.0))
+        report = strict_json(directory / "report.json")
+        self.assertEqual(report["output_q_max_angstrom_inverse"], 4.0)
+        self.assertEqual(
+            report["output_q_max_source"], f"nexus:{QMaxInputTests.dataset}"
+        )
 
     def test_q_limit_conversion_and_physical_bounds(self):
         full = (0.0, 85.0)

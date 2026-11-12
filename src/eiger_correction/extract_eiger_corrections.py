@@ -164,7 +164,9 @@ def parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help=(
-            "Final-output maximum Q in A^-1; default: unmasked pyFAI maximum. "
+            "Final-output maximum Q in A^-1; default: NeXus "
+            "/entry/plan_metadata/experiment_definition/data/q_max, "
+            "or the unmasked pyFAI maximum if absent/empty. "
             "Does not limit detector fitting or overlap refinement"
         ),
     )
@@ -259,6 +261,44 @@ def load_geometry(
         )
     provenance["geometry_sha256"] = hashlib.sha256(payload).hexdigest()
     return config, provenance
+
+
+def resolve_q_max(
+    scan_path: str | Path, q_max: float | None = None
+) -> tuple[float | None, str]:
+    """Resolve output Q (A^-1): explicit CLI value, NeXus value, then geometry.
+
+    Absent, null, zero-length and blank-string metadata are empty. Malformed
+    nonempty metadata is an error rather than a silently ignored acquisition limit.
+    An explicit override never reads this optional dataset.
+    """
+    source = "cli"
+    if q_max is None:
+        dataset_path = "/entry/plan_metadata/experiment_definition/data/q_max"
+        with h5py.File(scan_path, "r") as nexus:
+            node = nexus.get(dataset_path)
+            if node is None:
+                return None, "pyfai"
+            if not isinstance(node, h5py.Dataset):
+                raise ValueError(f"Expected a scalar Q dataset at {dataset_path}")
+            if node.shape is None:
+                return None, "pyfai"
+            value = np.asarray(node[()])
+            if value.size == 0:
+                return None, "pyfai"
+            if value.size != 1:
+                raise ValueError(f"Expected one Q value at {dataset_path}")
+            scalar = value.reshape(-1)[0]
+            if isinstance(scalar, (str, bytes)) and not scalar.strip():
+                return None, "pyfai"
+            try:
+                q_max = float(scalar)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"Invalid Q value at {dataset_path}") from error
+        source = f"nexus:{dataset_path}"
+    if not np.isfinite(q_max) or q_max <= 0:
+        raise ValueError(f"q_max from {source} must be finite and positive (A^-1)")
+    return float(q_max), source
 
 
 def check_arguments(args: argparse.Namespace) -> None:
@@ -570,6 +610,9 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
         geometry, geometry_provenance = load_geometry(args.scan, args.geometry)
         record.data["inputs"] = {"scan": args.scan.resolve(), **geometry_provenance}
         raw = workflow.load_scan(args.scan, args.detector, args.monitor, args.metadata)
+        q_max, q_max_source = resolve_q_max(args.scan, args.q_max)
+        record.data["output_q_max_angstrom_inverse"] = q_max
+        record.data["output_q_max_source"] = q_max_source
         # Tiny optional metadata read, not another detector-data pass.
         with h5py.File(raw.path, "r") as source:
             current_path = "entry/instrument/synchrotron/current"
@@ -845,7 +888,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
             record.data["raw_audit"] = {"status": "not_requested"}
         with record.stage("final_integration"):
             output_range = output_theta_range(
-                args.q_max, model.geometry.wavelength, theta_range
+                q_max, model.geometry.wavelength, theta_range
             )
             output = integrate_output(
                 scan,
