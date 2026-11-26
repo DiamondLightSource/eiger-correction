@@ -69,6 +69,41 @@ class Scan:
     shape: tuple[int, int]
     # Optional raw-frame synchrotron ring current, used only for diagnostics.
     ring_current: FloatArray | None = None
+    # Detector-file frame index of each entry in ``angles`` when this scan is a
+    # subset (one data point of a multi-point scan); None means 0..n-1.
+    source_frames: IntArray | None = None
+
+
+def source_frame_indices(scan: Scan) -> IntArray:
+    """Detector-file frame indices for each frame of ``scan``, in order."""
+    frames = getattr(scan, "source_frames", None)
+    if frames is None:
+        return np.arange(len(scan.angles))
+    return np.asarray(frames, dtype=np.intp)
+
+
+def subset_scan(scan: Scan, frames: ArrayLike) -> Scan:
+    """Select raw frames (e.g. one data point) without copying detector data.
+
+    ``frames`` index ``scan.angles``; detector reads are redirected through
+    ``source_frames`` so the subset can be grouped and audited like a full scan.
+    """
+    frames = np.asarray(frames, dtype=np.intp).reshape(-1)
+    if not frames.size or np.any((frames < 0) | (frames >= len(scan.angles))):
+        raise ValueError("Data-point frames must be nonempty valid frame indices")
+    if np.unique(frames).size != frames.size:
+        raise ValueError("Data-point frames must not repeat")
+    ring = scan.ring_current
+    if ring is not None:
+        ring = np.asarray(ring)
+        ring = ring[frames] if ring.shape == scan.angles.shape else None
+    return replace(
+        scan,
+        angles=np.asarray(scan.angles)[frames],
+        i0=np.asarray(scan.i0)[frames],
+        ring_current=ring,
+        source_frames=source_frame_indices(scan)[frames],
+    )
 
 
 def load_scan(
@@ -216,11 +251,14 @@ def aggregate_equal_angle_frames(
             chunks=(1, *scan.shape),
             compression="lzf",
         )
+        source_frames = source_frame_indices(scan)
         for group_index, members in enumerate(group_members):
             total = np.zeros(scan.shape, dtype=np.float64)
             invalid = np.zeros(scan.shape, dtype=bool)
             for frame_index in members:
-                frame = np.asarray(source_data[int(frame_index)], dtype=np.float64)
+                frame = np.asarray(
+                    source_data[int(source_frames[frame_index])], dtype=np.float64
+                )
                 frame_invalid = (
                     ~np.isfinite(frame) | (frame < 0) | (frame >= saturation)
                 )
@@ -233,7 +271,8 @@ def aggregate_equal_angle_frames(
         offsets[1:] = np.cumsum([len(members) for members in group_members])
         target.create_dataset("group_offsets", data=offsets)
         target.create_dataset(
-            "source_frame_indices", data=np.concatenate(group_members)
+            "source_frame_indices",
+            data=source_frames[np.concatenate(group_members)],
         )
         target.attrs["aggregation"] = (
             "angle-group raw-count sum; I0 summed; "
@@ -250,6 +289,7 @@ def aggregate_equal_angle_frames(
         i0=grouped_i0,
         # Raw-frame metadata does not describe the grouped positions.
         ring_current=None,
+        source_frames=None,
     ), group_members
 
 
