@@ -31,6 +31,16 @@ def _label(name: str) -> str:
     return text[:1].upper() + text[1:]
 
 
+def _stacked(summary: Mapping[str, Any]) -> str:
+    """patterns.h5 paths and [point, bin] shapes of the stacked intensities."""
+    rows = [
+        f"patterns.h5::{_text(item.get('path'))} "
+        f"[{' × '.join(_text(size) for size in item.get('shape', []))}]"
+        for item in summary.get("datasets", {}).values()
+    ]
+    return "; ".join(rows) if rows else "—"
+
+
 def _with_unit(value: object, unit: object) -> str:
     if value is None:
         return "—"
@@ -196,6 +206,11 @@ def render_markdown(record: Mapping[str, Any]) -> str:
             ("Data points", len(points)),
             ("Frame partition", inputs.get("data_point_partition")),
             ("Raw frames", inputs.get("raw_frames")),
+            (
+                "Common exported 2theta range (degrees)",
+                record.get("output_theta_range_deg"),
+            ),
+            ("Stacked patterns", _stacked(record.get("stacked_patterns", {}))),
         ]
     else:
         run_rows += [

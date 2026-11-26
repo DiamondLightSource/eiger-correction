@@ -1210,7 +1210,7 @@ def validate_response(
     return {"summary": summary, "frame_rows": frame_rows, "results": results}
 
 
-def _tag_nxdata(
+def tag_nxdata(
     group: h5py.Group, signal_name: str, axes: Sequence[str], interpretation: str
 ) -> None:
     """Modern NeXus plot declarations plus legacy dataset tags for DAWN readers."""
@@ -1239,7 +1239,7 @@ def _tag_calibration_plot(file: h5py.File) -> None:
             correction.create_dataset(name, data=np.arange(divisor.shape[dimension]))
         correction[name].attrs["units"] = "1"
         correction[name].attrs["long_name"] = label
-    _tag_nxdata(
+    tag_nxdata(
         correction, "combined_divisor", ("detector_row", "detector_column"), "image"
     )
     correction["combined_divisor"].attrs["units"] = "1"
@@ -1270,7 +1270,7 @@ def _tag_pattern_plot(file: h5py.File) -> None:
             if name == "merged_q"
             else "two_theta_deg"
         )
-        _tag_nxdata(group, "intensity", (axis_name,), "spectrum")
+        tag_nxdata(group, "intensity", (axis_name,), "spectrum")
         q_unit = "angstrom^-1" if q_angstrom else "nm^-1"
         group[axis_name].attrs["units"] = q_unit if name == "merged_q" else "degrees"
         group[axis_name].attrs["long_name"] = (
