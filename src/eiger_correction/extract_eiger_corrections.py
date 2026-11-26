@@ -1282,20 +1282,18 @@ def write_stacked_summary(
                 group["setpoint"].attrs["units"] = units
                 group["setpoint"].attrs["long_name"] = f"Setpoint ({units})"
                 point_axes.append("setpoint")
-            group.attrs["NX_class"] = "NXdata"
-            group.attrs["signal"] = "intensity"
-            group.attrs["axes"] = np.asarray(
-                [primary, axis_name], dtype=h5py.string_dtype("utf-8")
-            )
+            group["point_index"].attrs["long_name"] = "Data point index"
+            # Same NeXus + legacy dataset-level tags as the per-point entries, so
+            # DAWN and other readers plot intensity against the primary axes.
+            workflow.tag_nxdata(group, "intensity", (primary, axis_name), "image")
             for point_axis in point_axes:
                 group.attrs[f"{point_axis}_indices"] = 0
-            group.attrs[f"{axis_name}_indices"] = 1
-            group["intensity"].attrs["interpretation"] = "image"
             group["intensity"].attrs["long_name"] = "Normalized intensity (a.u.)"
             summary["datasets"][name] = {
                 "path": f"/{SUMMARY_ENTRY}/{name}/intensity",
                 "shape": list(intensity.shape),
             }
+        file.attrs["NX_class"] = "NXroot"
         file.attrs["default"] = SUMMARY_ENTRY
     return summary
 

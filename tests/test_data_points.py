@@ -207,6 +207,7 @@ class MultiPointExtractionTests(synthetic.TemporaryCase):
         with h5py.File(directory / "patterns.h5", "r") as target:
             self.assertEqual(sorted(target), [*labels, "summary"])
             self.assertEqual(target.attrs["default"], "summary")
+            self.assertEqual(target.attrs["NX_class"], "NXroot")
             summary = h5_group(target, "summary")
             self.assertEqual(summary.attrs["NX_class"], "NXentry")
             self.assertEqual(summary.attrs["default"], "merged_q")
@@ -222,6 +223,15 @@ class MultiPointExtractionTests(synthetic.TemporaryCase):
                 )
                 self.assertEqual(stacked.attrs["setpoint_indices"], 0)
                 self.assertEqual(stacked.attrs[f"{axis_name}_indices"], 1)
+                # Legacy dataset-level tags read by DAWN.
+                signal = h5_dataset(stacked, "intensity")
+                self.assertEqual(signal.attrs["signal"], 1)
+                self.assertEqual(signal.attrs["axes"], f"setpoint:{axis_name}")
+                self.assertEqual(signal.attrs["interpretation"], "image")
+                for dimension, axis in enumerate(("setpoint", axis_name), start=1):
+                    self.assertEqual(stacked[axis].attrs["axis"], dimension)
+                    self.assertEqual(stacked[axis].attrs["primary"], 1)
+                self.assertEqual(stacked.attrs["measured_temperature_indices"], 0)
                 self.assertNotIn("sigma", stacked)
                 intensity = h5_dataset(stacked, "intensity")[()]
                 bins = h5_dataset(stacked, axis_name).shape[0]
