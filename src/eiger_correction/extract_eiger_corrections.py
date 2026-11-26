@@ -11,6 +11,7 @@ import tempfile
 import time
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -572,25 +573,22 @@ def save_xy(
     directory: Path,
     processed: Mapping[str, Any],
     stem: str = "pattern",
-    note: str = "",
 ) -> dict[str, str]:
-    """Write supported bins of both independently integrated radial grids."""
+    """Write supported bins of both independently integrated radial grids.
+
+    Plain two-column data with no header line; units and provenance are in
+    the pattern HDF5 and reports.
+    """
     outputs = {}
-    for name, suffix, label in (
-        ("merged_2theta", "tth", "2theta_deg"),
-        ("merged_q", "q", "q_A^-1"),
-    ):
+    for name, suffix in (("merged_2theta", "tth"), ("merged_q", "q")):
         group = processed["groups"][name]
         supported = (group["accumulators"][1] > 0) & np.isfinite(group["intensity"])
         if not supported.any():
             raise ValueError(f"No supported final output bins in {name}")
         xy = np.column_stack((group["axis"][supported], group["intensity"][supported]))
         filename = f"{stem}_{suffix}.xy"
-        header = f"{label} intensity; two_stage_overlap; measured I0 retained"
-        if note:
-            header += f"; {note}"
         with (directory / filename).open("x", encoding="ascii") as stream:
-            np.savetxt(stream, xy, fmt="%.10g", header=header)
+            np.savetxt(stream, xy, fmt="%.10g")
         np.testing.assert_allclose(
             np.loadtxt(directory / filename, ndmin=2), xy, rtol=6e-10, atol=1e-12
         )
@@ -767,7 +765,6 @@ class PointContext:
         pattern_path: Path,
         xy_stem: str = "pattern",
         label: str | None = None,
-        note: str = "",
     ) -> None:
         self.record = record
         self.data = data
@@ -776,7 +773,6 @@ class PointContext:
         self.pattern_path = pattern_path
         self.xy_stem = xy_stem
         self.label = label
-        self.note = note
 
     def stage(self, name: str) -> Any:
         return self.record.stage(f"{self.label}/{name}" if self.label else name)
@@ -800,6 +796,7 @@ def process_point(
     azimuth: tuple[float, float] | None,
     q_max: float | None,
     context: PointContext,
+    output_range: tuple[float, float] | None = None,
 ) -> Payload:
     """Aggregate, fit, integrate, export and diagnose one complete 2theta sweep."""
     import eiger_correction.eiger_workflow as workflow
@@ -1028,9 +1025,10 @@ def process_point(
         else:
             data["raw_audit"] = {"status": "not_requested"}
         with context.stage("final_integration"):
-            output_range = output_theta_range(
-                q_max, model.geometry.wavelength, theta_range
-            )
+            if output_range is None:
+                output_range = output_theta_range(
+                    q_max, model.geometry.wavelength, theta_range
+                )
             output = integrate_output(
                 scan,
                 model,
@@ -1094,7 +1092,7 @@ def process_point(
             )
             data["outputs"] = {
                 "calibration": context.relative(calibration_path),
-                **save_xy(context.directory, output, context.xy_stem, context.note),
+                **save_xy(context.directory, output, context.xy_stem),
             }
         with context.stage("jpeg_diagnostics"):
             summary = save_diagnostics(
@@ -1171,6 +1169,135 @@ def check_combined_pattern(
                 np.testing.assert_allclose(
                     workflow.h5_dataset(group, key)[()], payload[key], equal_nan=True
                 )
+
+
+SUMMARY_ENTRY = "summary"
+
+
+def common_output_range(
+    raw: Scan,
+    geometry: Mapping[str, Any],
+    args: argparse.Namespace,
+    azimuth: tuple[float, float] | None,
+    q_max: float | None,
+) -> tuple[float, float]:
+    """One final 2theta range for every data point, so their grids can be stacked.
+
+    An output Q limit already gives a fixed range. Otherwise use the largest
+    unmasked pyFAI pixel-centre angle over all motor positions in the scan with
+    the fixed (native + module-gap) mask only: it cannot depend on any point's
+    fitted bad pixels, so bins a point cannot reach are unsupported, not cropped.
+    """
+    import eiger_correction.eiger_workflow as workflow
+
+    positions = replace(raw, angles=np.unique(raw.angles), source_frames=None)
+    positions.i0 = np.ones(len(positions.angles))
+    model = workflow.PhysicalModel(
+        geometry, positions, args.polarization, args.density, azimuth_range=azimuth
+    )
+    if q_max is not None:
+        return output_theta_range(q_max, model.geometry.wavelength, (0.0, 180.0))
+    boundary, _ = workflow.detector_layout(raw.shape)
+    return workflow.theta_range_for_scan(
+        positions, model, np.asarray(raw.native_mask) | boundary
+    )
+
+
+def write_stacked_summary(
+    path: Path, points: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """Add a 2D [data point, radial bin] final-intensity dataset per grid.
+
+    Each row is that point's final diffraction pattern exactly as exported to
+    its XY file; bins the XY omits as unsupported are NaN here. Every point must
+    share the same grid (no regridding or interpolation). Uncertainties and
+    accumulators stay in the per-point entries.
+    """
+    import eiger_correction.eiger_workflow as workflow
+
+    labels = [str(point["label"]) for point in points]
+    setpoints = [point["setpoint"] for point in points]
+    measured = np.array(
+        [
+            np.nan if point["measured_mean"] is None else point["measured_mean"]
+            for point in points
+        ]
+    )
+    unit = str(points[0]["unit"])
+    units = "degC" if unit == "C" else unit
+    has_setpoints = all(value is not None for value in setpoints)
+    steps = np.diff(np.asarray(setpoints, dtype=float)) if has_setpoints else None
+    # A plotting axis must be monotonic; heat/cool cycles fall back to index.
+    primary = (
+        "setpoint"
+        if steps is not None and (np.all(steps > 0) or np.all(steps < 0))
+        else "point_index"
+    )
+    summary: dict[str, Any] = {
+        "entry": SUMMARY_ENTRY,
+        "point_axis": primary,
+        "datasets": {},
+    }
+    with h5py.File(path, "r+") as file:
+        entry = file.create_group(SUMMARY_ENTRY)
+        entry.attrs["NX_class"] = "NXentry"
+        entry.attrs["default"] = "merged_q"
+        entry.attrs["description"] = (
+            "Final diffraction patterns stacked as [data point, radial bin]; "
+            "rows equal the per-point XY intensities, NaN where unsupported"
+        )
+        for name, axis_name in (
+            ("merged_q", "q_angstrom"),
+            ("merged_2theta", "two_theta_deg"),
+        ):
+            sources = [workflow.h5_group(file, f"{label}/{name}") for label in labels]
+            axis = workflow.h5_dataset(sources[0], axis_name)[()]
+            for label, source in zip(labels, sources, strict=True):
+                if not np.array_equal(workflow.h5_dataset(source, axis_name)[()], axis):
+                    raise ValueError(
+                        f"{label}/{name} grid differs from {labels[0]}; "
+                        "cannot stack data points"
+                    )
+            group = entry.create_group(name)
+            group.create_dataset(axis_name, data=axis)
+            group[axis_name].attrs.update(dict(sources[0][axis_name].attrs))
+            intensity = np.stack(
+                [workflow.h5_dataset(source, "intensity")[()] for source in sources]
+            )
+            group.create_dataset(
+                "intensity", data=intensity, compression="gzip", shuffle=True
+            )
+            group.create_dataset("point_index", data=np.arange(len(points)))
+            group.create_dataset("point_label", data=labels, dtype=h5py.string_dtype())
+            group.create_dataset("measured_temperature", data=measured)
+            group["measured_temperature"].attrs["units"] = units
+            group["measured_temperature"].attrs["long_name"] = (
+                f"Mean {points[0]['axis']} reading ({units})"
+            )
+            point_axes = ["point_index", "measured_temperature"]
+            if has_setpoints:
+                group.create_dataset(
+                    "setpoint", data=np.asarray(setpoints, dtype=float)
+                )
+                group["setpoint"].attrs["units"] = units
+                group["setpoint"].attrs["long_name"] = f"Setpoint ({units})"
+                point_axes.append("setpoint")
+            group.attrs["NX_class"] = "NXdata"
+            group.attrs["signal"] = "intensity"
+            group.attrs["axes"] = np.asarray(
+                [primary, axis_name], dtype=h5py.string_dtype("utf-8")
+            )
+            for point_axis in point_axes:
+                group.attrs[f"{point_axis}_indices"] = 0
+            group.attrs[f"{axis_name}_indices"] = 1
+            group["intensity"].attrs["interpretation"] = "image"
+            group["intensity"].attrs["long_name"] = "Normalized intensity (a.u.)"
+            summary["datasets"][name] = {
+                "path": f"/{SUMMARY_ENTRY}/{name}/intensity",
+                "shape": list(intensity.shape),
+            }
+        file.attrs["default"] = SUMMARY_ENTRY
+    return summary
 
 
 def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> None:
@@ -1299,6 +1426,9 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
         target.attrs["data_point_axis"] = POINT_AXIS_NAME
         target.attrs["data_points"] = len(points)
         target.attrs["default"] = points[0]["label"]
+    with record.stage("common_output_range"):
+        output_range = common_output_range(raw, geometry, args, azimuth, q_max)
+        record.data["output_theta_range_deg"] = output_range
     outputs: dict[str, str] = {"pattern": combined.name}
     point_records: list[dict[str, Any]] = record.data["data_points"]
     for point, data in zip(points, point_records, strict=True):
@@ -1306,11 +1436,6 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
         data["status"] = "running"
         point_directory = directory / label
         point_directory.mkdir(exist_ok=False)
-        note = f"{point['axis']} point {point['index'] + 1}"
-        if point["setpoint"] is not None:
-            note += f", setpoint {point['setpoint']:g} {point['unit']}"
-        if point["measured_mean"] is not None:
-            note += f", measured mean {point['measured_mean']:.4g} {point['unit']}"
         try:
             with tempfile.TemporaryDirectory(
                 dir=directory, prefix=".pattern_"
@@ -1330,8 +1455,8 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                         pattern_path,
                         xy_stem=label,
                         label=label,
-                        note=note,
                     ),
+                    output_range,
                 )
                 with record.stage(f"{label}/combine_pattern"):
                     with h5py.File(combined, "r+") as target:
@@ -1346,5 +1471,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
             if key.startswith("xy_"):
                 outputs[f"{label}_{key}"] = value
         del output
+    with record.stage("stacked_summary"):
+        record.data["stacked_patterns"] = write_stacked_summary(combined, points)
     outputs["log"] = "run.log"
     record.data["outputs"] = outputs

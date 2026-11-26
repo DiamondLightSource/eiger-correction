@@ -205,8 +205,38 @@ class MultiPointExtractionTests(synthetic.TemporaryCase):
         self.assertFalse(list(directory.glob(".grouped_*")))
         self.assertFalse(list(directory.glob(".pattern_*")))
         with h5py.File(directory / "patterns.h5", "r") as target:
-            self.assertEqual(sorted(target), labels)
-            self.assertEqual(target.attrs["default"], labels[0])
+            self.assertEqual(sorted(target), [*labels, "summary"])
+            self.assertEqual(target.attrs["default"], "summary")
+            summary = h5_group(target, "summary")
+            self.assertEqual(summary.attrs["NX_class"], "NXentry")
+            self.assertEqual(summary.attrs["default"], "merged_q")
+            for name, axis_name in (
+                ("merged_q", "q_angstrom"),
+                ("merged_2theta", "two_theta_deg"),
+            ):
+                stacked = h5_group(summary, name)
+                self.assertEqual(stacked.attrs["NX_class"], "NXdata")
+                self.assertEqual(stacked.attrs["signal"], "intensity")
+                self.assertEqual(
+                    np.asarray(stacked.attrs["axes"]).tolist(), ["setpoint", axis_name]
+                )
+                self.assertEqual(stacked.attrs["setpoint_indices"], 0)
+                self.assertEqual(stacked.attrs[f"{axis_name}_indices"], 1)
+                self.assertNotIn("sigma", stacked)
+                intensity = h5_dataset(stacked, "intensity")[()]
+                bins = h5_dataset(stacked, axis_name).shape[0]
+                self.assertEqual(intensity.shape, (2, bins))
+                for row, label in enumerate(labels):
+                    np.testing.assert_array_equal(
+                        intensity[row],
+                        h5_dataset(target, f"{label}/{name}/intensity")[()],
+                    )
+                np.testing.assert_array_equal(
+                    h5_dataset(stacked, "setpoint")[()], [50.0, 100.0]
+                )
+                np.testing.assert_allclose(
+                    h5_dataset(stacked, "measured_temperature")[()], [50.2, 99.8]
+                )
             self.assertEqual(target.attrs["data_point_axis"], "blower-temperature")
             for label, setpoint, temperature in zip(
                 labels, (50.0, 100.0), (50.2, 99.8), strict=True
@@ -233,8 +263,8 @@ class MultiPointExtractionTests(synthetic.TemporaryCase):
                 xy = np.loadtxt(directory / f"{label}_tth.xy")
                 np.testing.assert_allclose(xy[:, 1], expected["intensity"], rtol=6e-10)
                 self.assertTrue((directory / f"{label}_q.xy").exists())
-                header = (directory / f"{label}_tth.xy").read_text().splitlines()[0]
-                self.assertIn(f"setpoint {setpoint:g} C", header)
+                first = (directory / f"{label}_tth.xy").read_text().splitlines()[0]
+                self.assertFalse(first.startswith("#"))
         np.testing.assert_array_equal(
             workflow.load_calibration(
                 directory / labels[0] / "detector_corrections.h5"
@@ -243,6 +273,12 @@ class MultiPointExtractionTests(synthetic.TemporaryCase):
         )
         text = (directory / "report.md").read_text()
         self.assertIn("## Data points", text)
+        self.assertEqual(
+            report["stacked_patterns"]["datasets"]["merged_q"]["path"],
+            "/summary/merged_q/intensity",
+        )
+        self.assertEqual(report["stages"]["stacked_summary"]["status"], "passed")
+        self.assertIn("Stacked patterns", text)
         self.assertIn("| point_02_100C | 100 °C | 99.8 ± 0 °C |", text)
         self.assertIn("[point_01_50C_tth.xy](point_01_50C_tth.xy)", text)
 
