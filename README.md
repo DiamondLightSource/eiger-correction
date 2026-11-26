@@ -59,7 +59,7 @@ eiger-correction /dls/i15-1/data/2026/cm44163-5/i15-1-102108.nxs --output-dir /s
 ```
 
 ```text
-patterns.h5               # all points; one NXentry per point (point_01_50C, ...)
+patterns.h5               # all points: 2D summary entry + one NXentry per point
 point_01_50C_tth.xy       # per-point two-column 2theta / intensity
 point_01_50C_q.xy         # per-point two-column Q / intensity
 point_02_100C_tth.xy
@@ -79,10 +79,21 @@ lower angle, and points are labelled without a setpoint (`point_01`, ...).
 Each point is processed independently with the full single-scan pipeline (own
 angle grouping, detector fit, held-out validation, overlap scales and optional
 raw audit), because the sample pattern — and so the stage-1 common profile —
-changes between points. Each `patterns.h5` entry has the same layout as the
-single-scan `pattern.h5` `entry`, plus a `data_point` collection with the setpoint,
-per-frame readings, source-frame indices and measured mean/SD/min/max. The XY
-header records the point, setpoint and measured mean. The Markdown report adds a
+changes between points. All points are exported on one common grid: the
+`--q-max`/NeXus Q limit when set, otherwise the largest unmasked pixel-centre
+2theta over every motor position in the scan, using only the fixed mask (so it
+does not depend on any point's fitted bad pixels).
+
+`patterns.h5` opens (root `default`) on a `summary` NXentry holding the final
+diffraction patterns as 2D `[data point, bin]` datasets:
+`/summary/merged_q/intensity` (versus `q_angstrom`, the entry default) and
+`/summary/merged_2theta/intensity` (versus `two_theta_deg`). Each row is exactly
+that point's XY intensity; bins the XY omits as unsupported are NaN. Each NXdata
+also has `setpoint`, `measured_temperature`, `point_index` and `point_label`;
+the plotting axis is `setpoint` when the setpoints are strictly monotonic,
+otherwise `point_index`. Each per-point entry has the same layout as the
+single-scan `pattern.h5` `entry` (uncertainties and accumulators stay there), plus a `data_point` collection with the setpoint,
+per-frame readings, source-frame indices and measured mean/SD/min/max. The Markdown report adds a
 **Data points** section with two per-point tables (setpoint, measured temperature,
 frames, positions and summed I0; then 2theta ranges, supported bins, overlap graph,
 edge RMS, held-out overlap, integrity, raw audit and warning count) and groups the
@@ -195,7 +206,7 @@ Every run directory contains:
 	signal/normalization/variance/pixel-weight accumulators per position and merged,
 	fit-range flags, angles, I0, gains and applied corrections.
 - **Two-column XY** (`pattern_tth.xy`, `pattern_q.xy`): 2theta degrees or Q (Å⁻¹)
-  and intensity, ten significant digits;
+  and intensity, ten significant digits, no header line;
 	unsupported bins are omitted, not filled or interpolated.
 - **Seven JPEGs:** actual angle grouping; geometry-only azimuth masks; response
 	maps/sensor gains/monitors; Q sampling; stage-1/final gains; full/zoom intensity;
