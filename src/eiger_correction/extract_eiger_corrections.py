@@ -519,33 +519,6 @@ def integrate_output(
     return output
 
 
-def save_xy(directory: Path, processed: Mapping[str, Any]) -> dict[str, str]:
-    """Write supported bins of both independently integrated radial grids."""
-    outputs = {}
-    for name, suffix, label in (
-        ("merged_2theta", "tth", "2theta_deg"),
-        ("merged_q", "q", "q_A^-1"),
-    ):
-        group = processed["groups"][name]
-        supported = (group["accumulators"][1] > 0) & np.isfinite(group["intensity"])
-        if not supported.any():
-            raise ValueError(f"No supported final output bins in {name}")
-        xy = np.column_stack((group["axis"][supported], group["intensity"][supported]))
-        filename = f"pattern_{suffix}.xy"
-        with (directory / filename).open("x", encoding="ascii") as stream:
-            np.savetxt(
-                stream,
-                xy,
-                fmt="%.10g",
-                header=f"{label} intensity; two_stage_overlap; measured I0 retained",
-            )
-        np.testing.assert_allclose(
-            np.loadtxt(directory / filename, ndmin=2), xy, rtol=6e-10, atol=1e-12
-        )
-        outputs[f"xy_{suffix}"] = filename
-    return outputs
-
-
 def raw_audit(
     workflow: ModuleType,
     raw: Scan,
@@ -561,10 +534,11 @@ def raw_audit(
     index = int(np.argmax(scan.angles))
     counts = np.zeros(scan.shape)
     invalid = np.zeros(scan.shape, dtype=bool)
+    source_frames = workflow.source_frame_indices(raw)
     with h5py.File(raw.detector_path, "r") as source:
         frames = workflow.h5_dataset(source, raw.detector_dataset)
         for member in groups[index]:
-            frame = np.asarray(frames[int(member)], dtype=float)
+            frame = np.asarray(frames[int(source_frames[member])], dtype=float)
             bad = ~np.isfinite(frame) | (frame < 0) | (frame >= saturation)
             invalid |= bad
             counts += np.where(bad, 0, frame)
@@ -594,82 +568,250 @@ def raw_audit(
     return {"status": "passed", "position": index, "raw_frames": len(groups[index])}
 
 
-def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> None:
-    # Register compressed detector filters and import scientific libraries inside
-    # the captured run, so library messages/warnings go to run.log as well.
-    import hdf5plugin  # noqa: F401
+def save_xy(
+    directory: Path,
+    processed: Mapping[str, Any],
+    stem: str = "pattern",
+    note: str = "",
+) -> dict[str, str]:
+    """Write supported bins of both independently integrated radial grids."""
+    outputs = {}
+    for name, suffix, label in (
+        ("merged_2theta", "tth", "2theta_deg"),
+        ("merged_q", "q", "q_A^-1"),
+    ):
+        group = processed["groups"][name]
+        supported = (group["accumulators"][1] > 0) & np.isfinite(group["intensity"])
+        if not supported.any():
+            raise ValueError(f"No supported final output bins in {name}")
+        xy = np.column_stack((group["axis"][supported], group["intensity"][supported]))
+        filename = f"{stem}_{suffix}.xy"
+        header = f"{label} intensity; two_stage_overlap; measured I0 retained"
+        if note:
+            header += f"; {note}"
+        with (directory / filename).open("x", encoding="ascii") as stream:
+            np.savetxt(stream, xy, fmt="%.10g", header=header)
+        np.testing.assert_allclose(
+            np.loadtxt(directory / filename, ndmin=2), xy, rtol=6e-10, atol=1e-12
+        )
+        outputs[f"xy_{suffix}"] = filename
+    return outputs
 
+
+# Multi-point scans: one complete diffraction pattern per value of a slow
+# "data point" axis (currently the blower temperature), each made from a full
+# 2theta sweep. Points are processed independently because the sample pattern,
+# and therefore the stage-1 common profile, changes between points.
+POINT_AXIS_PATH = "entry/fastcs_eiger/blower-temperature"
+POINT_AXIS_NAME = "blower-temperature"
+COLLECTION_SPECIFICATION_PATH = "entry/plan_metadata/collection_specification"
+# Allowed difference between recorded motor 2theta and the planned 2theta when
+# assigning frames to data points from the collection specification.
+SPECIFICATION_ANGLE_TOLERANCE = 0.05
+
+
+def _points_from_specification(
+    blob: object, angles: NDArray[np.floating[Any]]
+) -> list[dict[str, Any]] | None:
+    """Frame ranges from a per-temperature collection specification, if present.
+
+    Returns None when the metadata does not have the per-point form. A
+    specification of that form that disagrees with the recorded frames is an
+    error rather than a silent fallback.
+    """
+    if isinstance(blob, np.ndarray):
+        if blob.size != 1:
+            return None
+        blob = blob.reshape(-1)[0]
+    if isinstance(blob, bytes):
+        blob = blob.decode("utf-8", errors="replace")
+    if not isinstance(blob, str):
+        return None
+    try:
+        specification = json.loads(blob)
+    except ValueError:
+        return None
+    if (
+        not isinstance(specification, list)
+        or not specification
+        or not all(
+            isinstance(item, dict)
+            and isinstance(item.get("collection_specification"), list)
+            for item in specification
+        )
+    ):
+        return None
+    points: list[dict[str, Any]] = []
+    expected: list[float] = []
+    start = 0
+    for item in specification:
+        steps = item["collection_specification"]
+        try:
+            frames = [int(step["frames"]) for step in steps]
+            planned = [float(step["tth"]) for step in steps]
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"Malformed {COLLECTION_SPECIFICATION_PATH}: each step needs "
+                "'tth' and 'frames'"
+            ) from error
+        if any(count < 1 for count in frames):
+            raise ValueError(f"{COLLECTION_SPECIFICATION_PATH}: frames must be >= 1")
+        setpoint = item.get("temperature_celsius")
+        points.append(
+            {
+                "start": start,
+                "stop": start + sum(frames),
+                "setpoint": None if setpoint is None else float(setpoint),
+                "unit": str(item.get("temperature_unit", "C")),
+                "planned_positions": len(steps),
+            }
+        )
+        expected.extend(np.repeat(planned, frames).tolist())
+        start += sum(frames)
+    if start != len(angles):
+        raise ValueError(
+            f"{COLLECTION_SPECIFICATION_PATH} plans {start} frames but the scan "
+            f"recorded {len(angles)}"
+        )
+    deviation = np.abs(np.asarray(expected) - angles)
+    if np.any(deviation > SPECIFICATION_ANGLE_TOLERANCE):
+        frame = int(np.argmax(deviation))
+        raise ValueError(
+            f"Recorded 2theta {angles[frame]:.5g} at frame {frame} differs from the "
+            f"planned {expected[frame]:.5g} in {COLLECTION_SPECIFICATION_PATH}"
+        )
+    return points
+
+
+def _points_from_sweeps(
+    angles: NDArray[np.floating[Any]], tolerance: float
+) -> list[dict[str, Any]]:
+    """Fallback: a new data point starts wherever 2theta returns to lower angle."""
+    starts = [0, *(np.flatnonzero(np.diff(angles) < -tolerance) + 1).tolist()]
+    stops = [*starts[1:], len(angles)]
+    return [
+        {"start": start, "stop": stop, "setpoint": None, "unit": "C"}
+        for start, stop in zip(starts, stops, strict=True)
+    ]
+
+
+def point_label(index: int, setpoint: float | None) -> str:
+    """Stable, filesystem-safe name such as ``point_01_50C``."""
+    label = f"point_{index + 1:02d}"
+    if setpoint is not None:
+        label += f"_{setpoint:g}C".replace("-", "m").replace(".", "p")
+    return label
+
+
+def find_data_points(
+    scan_path: str | Path,
+    angles: NDArray[np.floating[Any]],
+    angle_tolerance: float = 0.001,
+) -> list[dict[str, Any]] | None:
+    """Partition a multi-point scan into contiguous frame ranges.
+
+    Returns None for ordinary single-point scans (no data-point axis). Frames
+    are assigned from the plan's collection specification when available,
+    otherwise from 2theta sweep restarts. Each point records the measured
+    data-point axis readings for its frames.
+    """
+    angles = np.asarray(angles, dtype=float).reshape(-1)
+    with h5py.File(scan_path, "r") as source:
+        node = source.get(POINT_AXIS_PATH)
+        if not isinstance(node, h5py.Dataset):
+            return None
+        readings = np.asarray(node[()], dtype=float).reshape(-1)
+        specification = source.get(COLLECTION_SPECIFICATION_PATH)
+        blob = specification[()] if isinstance(specification, h5py.Dataset) else None
+    if readings.shape != angles.shape:
+        raise ValueError(
+            f"{POINT_AXIS_PATH} has {readings.size} readings for {angles.size} frames"
+        )
+    points = _points_from_specification(blob, angles)
+    method = "collection_specification"
+    if points is None:
+        points = _points_from_sweeps(angles, angle_tolerance)
+        method = "2theta_sweep_restart"
+    for index, point in enumerate(points):
+        values = readings[point["start"] : point["stop"]]
+        finite = values[np.isfinite(values)]
+        point.update(
+            index=index,
+            label=point_label(index, point["setpoint"]),
+            axis=POINT_AXIS_NAME,
+            partition=method,
+            raw_frames=point["stop"] - point["start"],
+            readings=values,
+            measured_mean=float(finite.mean()) if finite.size else None,
+            measured_std=float(finite.std()) if finite.size else None,
+            measured_min=float(finite.min()) if finite.size else None,
+            measured_max=float(finite.max()) if finite.size else None,
+        )
+    return points
+
+
+class PointContext:
+    """Where one data point's record entries, stages and products go.
+
+    For an ordinary scan ``data`` is the top-level record, so the report keeps
+    its original layout. For a multi-point scan each point gets its own record
+    dictionary, stage-name prefix and product subdirectory.
+    """
+
+    def __init__(
+        self,
+        record: RunRecord,
+        data: dict[str, Any],
+        directory: Path,
+        product_directory: Path,
+        pattern_path: Path,
+        xy_stem: str = "pattern",
+        label: str | None = None,
+        note: str = "",
+    ) -> None:
+        self.record = record
+        self.data = data
+        self.directory = directory
+        self.product_directory = product_directory
+        self.pattern_path = pattern_path
+        self.xy_stem = xy_stem
+        self.label = label
+        self.note = note
+
+    def stage(self, name: str) -> Any:
+        return self.record.stage(f"{self.label}/{name}" if self.label else name)
+
+    def warn(self, message: str) -> None:
+        if self.label is None:
+            self.record.data["warnings"].append(message)
+        else:
+            self.data.setdefault("warnings", []).append(message)
+            self.record.data["warnings"].append(f"{self.label}: {message}")
+
+    def relative(self, path: Path) -> str:
+        """Report-relative product path."""
+        return path.relative_to(self.directory).as_posix()
+
+
+def process_point(
+    args: argparse.Namespace,
+    raw: Scan,
+    geometry: Mapping[str, Any],
+    azimuth: tuple[float, float] | None,
+    q_max: float | None,
+    context: PointContext,
+) -> Payload:
+    """Aggregate, fit, integrate, export and diagnose one complete 2theta sweep."""
     import eiger_correction.eiger_workflow as workflow
     from eiger_correction.eiger_diagnostics import save_diagnostics
 
-    with record.stage("inputs"):
-        check_arguments(args)
-        # Scientific fitting and saved calibration settings retain nm^-1.
-        # Convert once at the CLI boundary, without mutating recorded arguments.
-        fit_q_range = (float(args.fit_q_range[0] * 10), float(args.fit_q_range[1] * 10))
-        fit_bins = radial_bins(tuple(args.fit_q_range), args.q_step_size)
-        geometry, geometry_provenance = load_geometry(args.scan, args.geometry)
-        record.data["inputs"] = {"scan": args.scan.resolve(), **geometry_provenance}
-        raw = workflow.load_scan(args.scan, args.detector, args.monitor, args.metadata)
-        q_max, q_max_source = resolve_q_max(args.scan, args.q_max)
-        record.data["output_q_max_angstrom_inverse"] = q_max
-        record.data["output_q_max_source"] = q_max_source
-        # Tiny optional metadata read, not another detector-data pass.
-        with h5py.File(raw.path, "r") as source:
-            current_path = "entry/instrument/synchrotron/current"
-            if current_path in source:
-                try:
-                    raw.ring_current = np.asarray(
-                        workflow.h5_dataset(source, current_path)[()], dtype=float
-                    ).reshape(-1)
-                except (ValueError, TypeError, OSError):
-                    record.data["warnings"].append(
-                        "Optional ring-current metadata could not be decoded; "
-                        "overlay omitted."
-                    )
-        azimuth = workflow.validate_azimuth_range(
-            None if args.all_azimuths else args.azimuth_range
-        )
-        packages: dict[str, str] = {}
-        for name in (
-            "numpy",
-            "scipy",
-            "h5py",
-            "pyFAI",
-            "xraylib",
-            "matplotlib",
-            "hdf5plugin",
-        ):
-            try:
-                packages[name] = version(name)
-            except PackageNotFoundError:
-                packages[name] = "unknown"
-        record.data["software"] = {
-            "python": sys.version,
-            "platform": platform.platform(),
-            "packages": packages,
-            "source_sha256": {
-                name: hashlib.sha256(
-                    Path(__file__).with_name(name).read_bytes()
-                ).hexdigest()
-                for name in (
-                    "extract_eiger_corrections.py",
-                    "eiger_workflow.py",
-                    "eiger_diagnostics.py",
-                    "eiger_report.py",
-                )
-            },
-        }
-        record.data["inputs"] = {
-            "scan": raw.path,
-            "detector": raw.detector_path,
-            **geometry_provenance,
-            "raw_frames": len(raw.angles),
-            "azimuth_range_deg": azimuth,
-        }
-
-    with tempfile.TemporaryDirectory(dir=directory, prefix=".grouped_") as temporary:
-        with record.stage("aggregation"):
+    record, data = context.record, context.data
+    fit_q_range = (float(args.fit_q_range[0] * 10), float(args.fit_q_range[1] * 10))
+    fit_bins = radial_bins(tuple(args.fit_q_range), args.q_step_size)
+    with tempfile.TemporaryDirectory(
+        dir=context.directory, prefix=".grouped_"
+    ) as temporary:
+        with context.stage("aggregation"):
             scan, groups = workflow.aggregate_equal_angle_frames(
                 raw,
                 Path(temporary) / "frames.h5",
@@ -689,7 +831,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
             np.testing.assert_allclose(
                 scan.i0, [raw.i0[members].sum() for members in groups], rtol=1e-14
             )
-            record.data["aggregation"] = {
+            data["aggregation"] = {
                 "positions": len(groups),
                 "group_sizes": sizes,
                 "angle_spans_deg": [
@@ -701,7 +843,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                     "Complete frame partition; arithmetic mean motor angles; summed I0"
                 ),
             }
-        with record.stage("geometry"):
+        with context.stage("geometry"):
             model = workflow.PhysicalModel(
                 geometry, scan, args.polarization, args.density, azimuth_range=azimuth
             )
@@ -710,7 +852,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
             sensors[base_mask] = -1
             vertical = model.vertical_check()
             workflow.constant_pattern_check(model, base_mask, fit_q_range, fit_bins)
-            record.data["geometry_checks"] = {
+            data["geometry_checks"] = {
                 "vertical": vertical,
                 "constant_pattern": "passed",
                 "fixed_mask_pixels": int(base_mask.sum()),
@@ -741,7 +883,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 "group_sizes": sizes,
             },
         }
-        with record.stage("fit_cache"):
+        with context.stage("fit_cache"):
             cache = workflow.build_cache(
                 scan,
                 model,
@@ -751,7 +893,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 saturation=np.inf,
             )
             indices = np.array(sorted(cache), dtype=int)
-            record.data["cache"] = {
+            data["cache"] = {
                 "positions": indices,
                 "observations": sum(len(item["pixels"]) for item in cache.values()),
                 "bytes": sum(
@@ -759,9 +901,9 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 ),
             }
         reports: list[dict[str, Any]] = []
-        with record.stage("held_out_validation"):
+        with context.stage("held_out_validation"):
             if args.validation == "basic":
-                record.data["warnings"].append(
+                context.warn(
                     "Independent detector validation disabled (--validation basic)."
                 )
             else:
@@ -816,15 +958,15 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                             or not np.isfinite(after)
                             or after > before
                         ):
-                            record.data["warnings"].append(
+                            context.warn(
                                 f"Fold {fold}: detector-only {metric} did not "
                                 "improve or is nonfinite; inspect held-out metrics."
                             )
-                    record.data["held_out_validation"] = reports
+                    data["held_out_validation"] = reports
                     record.save()
                     del held_fit, validation
                 if len(sensor_gains) == 2:
-                    record.data["fold_sensor_log_gain_rms_percent"] = float(
+                    data["fold_sensor_log_gain_rms_percent"] = float(
                         100
                         * np.sqrt(
                             np.mean(
@@ -832,19 +974,19 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                             )
                         )
                     )
-        with record.stage("detector_fit"):
+        with context.stage("detector_fit"):
             fit = workflow.fit_response(
                 cache, indices, sensors, len(scan.angles), **options
             )
             fit["q_range"] = fit_q_range
-            record.data["detector_fit"] = {
+            data["detector_fit"] = {
                 "sensor_gains": fit["sensor_gains"],
                 "bad_pixels": int(fit["bad_pixel_mask"].sum()),
                 "history": fit["history"],
                 "stage1_gains": fit["frame_gains"],
             }
             del cache
-        with record.stage("theta_integration"):
+        with context.stage("theta_integration"):
             theta_range = workflow.theta_range_for_scan(
                 scan,
                 model,
@@ -854,8 +996,8 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
             unity = integrate_theta(
                 scan, model, fit, base_mask, theta_range, theta_bins, sizes
             )
-            record.data["theta_range_deg"] = theta_range
-        with record.stage("overlap_scales"):
+            data["theta_range_deg"] = theta_range
+        with context.stage("overlap_scales"):
             scale_fit = workflow.refine_position_scales(
                 unity["groups"]["merged_2theta"],
                 minimum_pixel_weight=args.overlap_min_pixels,
@@ -863,17 +1005,15 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 fractional_floor=args.overlap_floor,
             )
             final = workflow.apply_position_scales(unity, scale_fit["frame_gains"])
-            record.data["position_scale_refinement"] = scale_fit
-            record.data["integrity_checks"] = check_conservation(
-                unity, final, scale_fit
-            )
-            if record.data["integrity_checks"]["unsupported_bins"]:
-                record.data["warnings"].append(
+            data["position_scale_refinement"] = scale_fit
+            data["integrity_checks"] = check_conservation(unity, final, scale_fit)
+            if data["integrity_checks"]["unsupported_bins"]:
+                context.warn(
                     "Unsupported final bins are omitted from XY; inspect HDF5 coverage."
                 )
         if args.raw_audit:
-            with record.stage("raw_audit"):
-                record.data["raw_audit"] = raw_audit(
+            with context.stage("raw_audit"):
+                data["raw_audit"] = raw_audit(
                     workflow,
                     raw,
                     scan,
@@ -886,8 +1026,8 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                     args.saturation,
                 )
         else:
-            record.data["raw_audit"] = {"status": "not_requested"}
-        with record.stage("final_integration"):
+            data["raw_audit"] = {"status": "not_requested"}
+        with context.stage("final_integration"):
             output_range = output_theta_range(
                 q_max, model.geometry.wavelength, theta_range
             )
@@ -901,8 +1041,8 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 args.q_step_size,
                 final["frame_gains"],
             )
-            record.data["output_theta_range_deg"] = output_range
-        with record.stage("exports"):
+            data["output_theta_range_deg"] = output_range
+        with context.stage("exports"):
             settings.update(
                 position_scale_model="two_stage_overlap",
                 refine_all_position_scales=True,
@@ -916,7 +1056,7 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                     "replaces_stage1_gains": True,
                 },
             )
-            calibration_path = directory / "detector_corrections.h5"
+            calibration_path = context.product_directory / "detector_corrections.h5"
             export_fit = {**fit, "frame_gains": final["frame_gains"]}
             workflow.save_calibration(
                 calibration_path,
@@ -950,17 +1090,15 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 calibration["frame_gains"], final["frame_gains"]
             )
             workflow.save_processed(
-                directory / "pattern.h5", scan, calibration, model, output
+                context.pattern_path, scan, calibration, model, output
             )
-            record.data["outputs"] = {
-                "calibration": calibration_path.name,
-                "pattern": "pattern.h5",
-                **save_xy(directory, output),
-                "log": "run.log",
+            data["outputs"] = {
+                "calibration": context.relative(calibration_path),
+                **save_xy(context.directory, output, context.xy_stem, context.note),
             }
-        with record.stage("jpeg_diagnostics"):
+        with context.stage("jpeg_diagnostics"):
             summary = save_diagnostics(
-                directory,
+                context.product_directory,
                 raw,
                 scan,
                 groups,
@@ -975,5 +1113,238 @@ def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> Non
                 min_pixel_weight=args.overlap_min_pixels,
                 dpi=args.jpeg_dpi,
             )
-            record.data["diagnostics"] = summary
-            record.data["warnings"].extend(summary.get("warnings", []))
+            summary["figures"] = [
+                context.relative(context.product_directory / name)
+                for name in summary.get("figures", [])
+            ]
+            data["diagnostics"] = summary
+            for message in summary.get("warnings", []):
+                context.warn(message)
+    return output
+
+
+def combine_point_pattern(
+    target: h5py.File, source_path: Path, point: Mapping[str, Any]
+) -> None:
+    """Copy one point's pattern entry into the combined multi-point file."""
+    import eiger_correction.eiger_workflow as workflow
+
+    name = point["label"]
+    with h5py.File(source_path, "r") as source:
+        source.copy(source["entry"], target, name=name)
+        entry = workflow.h5_group(target, name)
+        # File-level provenance moves onto the entry; the file-level plot
+        # pointer ("default" -> "entry") must not replace the entry's own.
+        for key, value in source.attrs.items():
+            if key not in ("default", "NX_class"):
+                entry.attrs[key] = value
+    entry.attrs["NX_class"] = "NXentry"
+    entry.attrs["data_point_index"] = point["index"]
+    collection = entry.create_group("data_point")
+    collection.attrs["NX_class"] = "NXcollection"
+    collection.attrs["axis"] = point["axis"]
+    collection.attrs["partition"] = point["partition"]
+    if point["setpoint"] is not None:
+        setpoint = collection.create_dataset("setpoint", data=point["setpoint"])
+        setpoint.attrs["units"] = point["unit"]
+    readings = collection.create_dataset("readings", data=point["readings"])
+    readings.attrs["units"] = point["unit"]
+    readings.attrs["description"] = f"{point['axis']} reading for each raw frame"
+    collection.create_dataset(
+        "source_frame_indices", data=np.arange(point["start"], point["stop"])
+    )
+    for key in ("measured_mean", "measured_std", "measured_min", "measured_max"):
+        if point[key] is not None:
+            collection.attrs[key] = point[key]
+
+
+def check_combined_pattern(
+    path: Path, label: str, processed: Mapping[str, Any]
+) -> None:
+    """Read back a combined entry against the integrated arrays."""
+    import eiger_correction.eiger_workflow as workflow
+
+    with h5py.File(path, "r") as file:
+        for name, payload in processed["groups"].items():
+            group = workflow.h5_group(file, f"{label}/{name}")
+            for key in ("intensity", "sigma"):
+                np.testing.assert_allclose(
+                    workflow.h5_dataset(group, key)[()], payload[key], equal_nan=True
+                )
+
+
+def extract(args: argparse.Namespace, directory: Path, record: RunRecord) -> None:
+    # Register compressed detector filters and import scientific libraries inside
+    # the captured run, so library messages/warnings go to run.log as well.
+    import hdf5plugin  # noqa: F401
+
+    import eiger_correction.eiger_workflow as workflow
+
+    with record.stage("inputs"):
+        check_arguments(args)
+        geometry, geometry_provenance = load_geometry(args.scan, args.geometry)
+        record.data["inputs"] = {"scan": args.scan.resolve(), **geometry_provenance}
+        raw = workflow.load_scan(args.scan, args.detector, args.monitor, args.metadata)
+        q_max, q_max_source = resolve_q_max(args.scan, args.q_max)
+        record.data["output_q_max_angstrom_inverse"] = q_max
+        record.data["output_q_max_source"] = q_max_source
+        # Tiny optional metadata read, not another detector-data pass.
+        with h5py.File(raw.path, "r") as source:
+            current_path = "entry/instrument/synchrotron/current"
+            if current_path in source:
+                try:
+                    raw.ring_current = np.asarray(
+                        workflow.h5_dataset(source, current_path)[()], dtype=float
+                    ).reshape(-1)
+                except (ValueError, TypeError, OSError):
+                    record.data["warnings"].append(
+                        "Optional ring-current metadata could not be decoded; "
+                        "overlay omitted."
+                    )
+        points = find_data_points(raw.path, raw.angles, args.angle_tolerance)
+        azimuth = workflow.validate_azimuth_range(
+            None if args.all_azimuths else args.azimuth_range
+        )
+        packages: dict[str, str] = {}
+        for name in (
+            "numpy",
+            "scipy",
+            "h5py",
+            "pyFAI",
+            "xraylib",
+            "matplotlib",
+            "hdf5plugin",
+        ):
+            try:
+                packages[name] = version(name)
+            except PackageNotFoundError:
+                packages[name] = "unknown"
+        record.data["software"] = {
+            "python": sys.version,
+            "platform": platform.platform(),
+            "packages": packages,
+            "source_sha256": {
+                name: hashlib.sha256(
+                    Path(__file__).with_name(name).read_bytes()
+                ).hexdigest()
+                for name in (
+                    "extract_eiger_corrections.py",
+                    "eiger_workflow.py",
+                    "eiger_diagnostics.py",
+                    "eiger_report.py",
+                )
+            },
+        }
+        record.data["inputs"] = {
+            "scan": raw.path,
+            "detector": raw.detector_path,
+            **geometry_provenance,
+            "raw_frames": len(raw.angles),
+            "azimuth_range_deg": azimuth,
+        }
+        if points is not None:
+            record.data["inputs"]["data_point_axis"] = POINT_AXIS_NAME
+            record.data["inputs"]["data_point_partition"] = points[0]["partition"]
+            record.data["data_points"] = [
+                {
+                    key: point[key]
+                    for key in (
+                        "index",
+                        "label",
+                        "axis",
+                        "setpoint",
+                        "unit",
+                        "start",
+                        "stop",
+                        "raw_frames",
+                        "measured_mean",
+                        "measured_std",
+                        "measured_min",
+                        "measured_max",
+                        "readings",
+                    )
+                }
+                | {"status": "pending"}
+                for point in points
+            ]
+
+    if points is None:
+        process_point(
+            args,
+            raw,
+            geometry,
+            azimuth,
+            q_max,
+            PointContext(
+                record, record.data, directory, directory, directory / "pattern.h5"
+            ),
+        )
+        record.data["outputs"] = {
+            "calibration": record.data["outputs"]["calibration"],
+            "pattern": "pattern.h5",
+            **{
+                key: value
+                for key, value in record.data["outputs"].items()
+                if key.startswith("xy_")
+            },
+            "log": "run.log",
+        }
+        return
+
+    # One pattern file holds every data point as its own NXentry.
+    combined = directory / "patterns.h5"
+    with h5py.File(combined, "x") as target:
+        target.attrs["schema"] = "eiger_processed_multi_point_v1"
+        target.attrs["source_scan"] = str(raw.path)
+        target.attrs["data_point_axis"] = POINT_AXIS_NAME
+        target.attrs["data_points"] = len(points)
+        target.attrs["default"] = points[0]["label"]
+    outputs: dict[str, str] = {"pattern": combined.name}
+    point_records: list[dict[str, Any]] = record.data["data_points"]
+    for point, data in zip(points, point_records, strict=True):
+        label = point["label"]
+        data["status"] = "running"
+        point_directory = directory / label
+        point_directory.mkdir(exist_ok=False)
+        note = f"{point['axis']} point {point['index'] + 1}"
+        if point["setpoint"] is not None:
+            note += f", setpoint {point['setpoint']:g} {point['unit']}"
+        if point["measured_mean"] is not None:
+            note += f", measured mean {point['measured_mean']:.4g} {point['unit']}"
+        try:
+            with tempfile.TemporaryDirectory(
+                dir=directory, prefix=".pattern_"
+            ) as staging:
+                pattern_path = Path(staging) / "pattern.h5"
+                output = process_point(
+                    args,
+                    workflow.subset_scan(raw, np.arange(point["start"], point["stop"])),
+                    geometry,
+                    azimuth,
+                    q_max,
+                    PointContext(
+                        record,
+                        data,
+                        directory,
+                        point_directory,
+                        pattern_path,
+                        xy_stem=label,
+                        label=label,
+                        note=note,
+                    ),
+                )
+                with record.stage(f"{label}/combine_pattern"):
+                    with h5py.File(combined, "r+") as target:
+                        combine_point_pattern(target, pattern_path, point)
+                    check_combined_pattern(combined, label, output)
+        except BaseException:
+            data["status"] = "failed"
+            raise
+        data["status"] = "completed"
+        data["outputs"]["pattern"] = f"{combined.name}::/{label}"
+        for key, value in data["outputs"].items():
+            if key.startswith("xy_"):
+                outputs[f"{label}_{key}"] = value
+        del output
+    outputs["log"] = "run.log"
+    record.data["outputs"] = outputs

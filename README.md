@@ -47,7 +47,48 @@ run.log                   # full process log
 
 See [Outputs and unattended operation](#outputs-and-unattended-operation) for details.
 
-## Interactive notebook
+## Multi-point (temperature) scans
+
+Scans with a slow "data point" axis — currently the blower temperature,
+`/entry/fastcs_eiger/blower-temperature` — contain one complete 2theta sweep per
+data point. They are detected automatically and produce one diffraction pattern
+per point:
+
+```bash
+eiger-correction /dls/i15-1/data/2026/cm44163-5/i15-1-102108.nxs --output-dir /some/output/directory
+```
+
+```text
+patterns.h5               # all points; one NXentry per point (point_01_50C, ...)
+point_01_50C_tth.xy       # per-point two-column 2theta / intensity
+point_01_50C_q.xy         # per-point two-column Q / intensity
+point_02_100C_tth.xy
+point_02_100C_q.xy
+point_01_50C/             # per-point detector_corrections.h5 and JPEG diagnostics
+point_02_100C/
+report.json, report.md, run.log
+```
+
+Frames are assigned to points from the plan's
+`/entry/plan_metadata/collection_specification` (setpoint and planned frames per
+2theta step). The planned frame total must equal the recorded frames and each
+recorded 2theta must be within 0.05° of its planned value, otherwise the run
+fails. Without that metadata, a new point starts wherever 2theta returns to a
+lower angle, and points are labelled without a setpoint (`point_01`, ...).
+
+Each point is processed independently with the full single-scan pipeline (own
+angle grouping, detector fit, held-out validation, overlap scales and optional
+raw audit), because the sample pattern — and so the stage-1 common profile —
+changes between points. Each `patterns.h5` entry has the same layout as the
+single-scan `pattern.h5` `entry`, plus a `data_point` collection with the setpoint,
+per-frame readings, source-frame indices and measured mean/SD/min/max. The XY
+header records the point, setpoint and measured mean. The Markdown report adds a
+**Data points** section with two per-point tables (setpoint, measured temperature,
+frames, positions and summed I0; then 2theta ranges, supported bins, overlap graph,
+edge RMS, held-out overlap, integrity, raw audit and warning count) and groups the
+validation results and JPEG gallery by point. Stage names and warnings are
+prefixed with the point label. A failure in any point fails the run.
+
 
 [notebooks/extract_eiger_corrections.ipynb](notebooks/extract_eiger_corrections.ipynb)
 runs the same two-stage extraction step by step with the package functions, showing
